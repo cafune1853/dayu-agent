@@ -1,0 +1,15 @@
+prompt_name: infer_company_facets
+version: v1
+inputs:
+  - name: company_meta
+    type: json_block
+    required: true
+    description: 公司基础 meta 摘要
+  - name: business_model_candidates
+    type: json_block
+    required: true
+    description: 主业务类型候选词表
+  - name: constraint_candidates
+    type: json_block
+    required: true
+    description: 关键约束候选词表

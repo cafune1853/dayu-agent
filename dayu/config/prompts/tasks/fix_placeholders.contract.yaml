@@ -1,0 +1,27 @@
+prompt_name: fix_placeholders
+version: v1
+inputs:
+  - name: chapter
+    type: scalar
+    required: true
+    description: 当前章节标题
+  - name: company
+    type: scalar
+    required: true
+    description: 公司名称
+  - name: ticker
+    type: scalar
+    required: true
+    description: 股票代码
+  - name: fix_mode
+    type: scalar
+    required: true
+    description: 补强模式
+  - name: rewrite_compliant_content
+    type: scalar
+    required: true
+    description: 是否允许改写已合规内容
+  - name: chapter_markdown
+    type: markdown_block
+    required: true
+    description: 当前章节正文

@@ -1,0 +1,63 @@
+prompt_name: regenerate_chapter
+version: v1
+inputs:
+  - name: chapter
+    type: scalar
+    required: true
+    description: 当前章节标题
+  - name: company
+    type: scalar
+    required: true
+    description: 公司名称
+  - name: ticker
+    type: scalar
+    required: true
+    description: 股票代码
+  - name: company_facets_summary
+    type: markdown_block
+    required: true
+    description: 公司业务类型与关键约束摘要
+  - name: report_goal
+    type: scalar
+    required: true
+    description: 全文总目标
+  - name: audience_profile
+    type: scalar
+    required: true
+    description: 全局读者画像
+  - name: chapter_goal
+    type: scalar
+    required: true
+    description: 本章回答的总目标
+  - name: allow_new_facts
+    type: scalar
+    required: true
+    description: 是否允许补入新事实
+  - name: retry_scope
+    type: scalar
+    required: true
+    description: 本轮修复范围
+  - name: skeleton
+    type: markdown_block
+    required: true
+    description: 去除 HTML 注释后的章节骨架
+  - name: chapter_contract
+    type: json_block
+    required: true
+    description: 本章合同 JSON 对象
+  - name: item_rules
+    type: json_block
+    required: false
+    description: 局部条件写作规则列表
+  - name: last_audit_json_block
+    type: markdown_block
+    required: true
+    description: 上轮审计原始输出
+  - name: last_repair_contract
+    type: json_block
+    required: true
+    description: 结构化修复合同
+  - name: last_wrote_content
+    type: markdown_block
+    required: true
+    description: 上轮章节正文

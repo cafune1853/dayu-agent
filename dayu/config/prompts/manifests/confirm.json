@@ -1,0 +1,73 @@
+{
+  "scene": "confirm",
+  "model": {
+    "default_name": "mimo-v2-plan-thinking",
+    "allowed_names": [
+      "mimo-v2-flash-thinking",
+      "mimo-v2-pro-thinking",
+      "mimo-v2-plan-thinking",
+      "deepseek-thinking",
+      "qwen3-thinking",
+      "qwen3:30b-thinking",
+      "gpt-5.4",
+      "claude-sonnet-4-6",
+      "gemini-2.5-flash"
+    ],
+    "temperature_profile": "audit"
+  },
+  "runtime": {
+    "agent": {
+      "max_iterations": 24
+    },
+    "runner": {
+      "tool_timeout_seconds": 90.0
+    }
+  },
+  "version": "v1",
+  "description": "证据复核场景",
+  "extends": [],
+  "tool_selection": {
+    "mode": "select",
+    "tool_tags_any": [
+      "fins",
+      "web"
+    ]
+  },
+  "defaults": {
+    "missing_fragment_policy": "error"
+  },
+  "fragments": [
+    {
+      "id": "base_agents",
+      "type": "AGENTS",
+      "path": "base/agents.md",
+      "required": true,
+      "order": 100
+    },
+    {
+      "id": "base_fact_rules",
+      "type": "SOUL",
+      "path": "base/fact_rules.md",
+      "required": true,
+      "order": 200
+    },
+    {
+      "id": "base_tools",
+      "type": "TOOLS",
+      "path": "base/tools.md",
+      "required": true,
+      "order": 300
+    },
+    {
+      "id": "confirm_scene",
+      "type": "SCENE",
+      "path": "scenes/confirm.md",
+      "required": true,
+      "order": 400
+    }
+  ],
+  "context_slots": [
+    "fins_default_subject",
+    "base_user"
+  ]
+}

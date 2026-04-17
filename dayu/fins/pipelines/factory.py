@@ -1,0 +1,107 @@
+"""Pipeline 工厂。"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+from dayu.engine.processors.processor_registry import ProcessorRegistry
+from dayu.log import Log
+from dayu.fins.processors.registry import (
+    build_bs_experiment_registry,
+    build_fins_processor_registry,
+)
+from dayu.fins.resolver.market_resolver import MarketProfile
+from dayu.fins.storage import (
+    CompanyMetaRepositoryProtocol,
+    DocumentBlobRepositoryProtocol,
+    FilingMaintenanceRepositoryProtocol,
+    ProcessedDocumentRepositoryProtocol,
+    SourceDocumentRepositoryProtocol,
+)
+
+from .base import PipelineProtocol
+from .cn_pipeline import CnPipeline
+from .sec_pipeline import SecPipeline
+
+MODULE = "FINS.PIPELINE_FACTORY"
+
+# 可选的处理器路线提示：匹配 ``--processor-hint`` 参数
+_PROCESSOR_HINT_BS = "bs"
+
+
+def _build_registry_for_hint(processor_hint: Optional[str]) -> ProcessorRegistry:
+    """根据处理器路线提示构建注册表。
+
+    Args:
+        processor_hint: 可选路线提示（``"bs"`` 使用 BeautifulSoup 路线）。
+
+    Returns:
+        处理器注册表。
+
+    Raises:
+        RuntimeError: 构建失败时抛出。
+    """
+
+    if processor_hint == _PROCESSOR_HINT_BS:
+        Log.info("使用 BS 实验路线处理器注册表", module=MODULE)
+        return build_bs_experiment_registry()
+    return build_fins_processor_registry()
+
+
+def get_pipeline_from_market_profile(
+    market_profile: MarketProfile,
+    workspace_root: Path,
+    processor_hint: Optional[str] = None,
+    company_repository: CompanyMetaRepositoryProtocol | None = None,
+    source_repository: SourceDocumentRepositoryProtocol | None = None,
+    processed_repository: ProcessedDocumentRepositoryProtocol | None = None,
+    blob_repository: DocumentBlobRepositoryProtocol | None = None,
+    filing_maintenance_repository: FilingMaintenanceRepositoryProtocol | None = None,
+    processor_registry: ProcessorRegistry | None = None,
+) -> PipelineProtocol:
+    """根据 ``MarketProfile`` 构建对应 Pipeline。
+
+    Args:
+        market_profile: 市场画像。
+        workspace_root: 工作区根目录。
+        processor_hint: 可选处理器路线提示（``"bs"`` 使用 BeautifulSoup 路线）。
+        company_repository: 可选共享公司元数据仓储实例。
+        source_repository: 可选共享源文档仓储实例。
+        processed_repository: 可选共享 processed 文档仓储实例。
+        blob_repository: 可选共享文件对象仓储实例。
+        filing_maintenance_repository: 可选共享 filing 维护治理仓储实例。
+        processor_registry: 可选共享处理器注册表；传入后优先于 `processor_hint`。
+
+    Returns:
+        对应的 pipeline 实例。
+
+    Raises:
+        ValueError: 市场类型不支持时抛出。
+    """
+
+    Log.debug(
+        f"准备创建 pipeline: market={market_profile.market}",
+        module=MODULE,
+    )
+    registry = processor_registry if processor_registry is not None else _build_registry_for_hint(processor_hint)
+    if market_profile.market == "US":
+        return SecPipeline(
+            workspace_root=workspace_root,
+            processor_registry=registry,
+            company_repository=company_repository,
+            source_repository=source_repository,
+            processed_repository=processed_repository,
+            blob_repository=blob_repository,
+            filing_maintenance_repository=filing_maintenance_repository,
+        )
+    if market_profile.market in {"HK", "CN"}:
+        return CnPipeline(
+            workspace_root=workspace_root,
+            processor_registry=registry,
+            company_repository=company_repository,
+            source_repository=source_repository,
+            processed_repository=processed_repository,
+            blob_repository=blob_repository,
+        )
+    raise ValueError(f"不支持的 market: {market_profile.market}")

@@ -1,0 +1,390 @@
+"""reply outbox store 测试。"""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+
+import pytest
+
+from dayu.contracts.reply_outbox import ReplyOutboxState, ReplyOutboxSubmitRequest
+from dayu.host.host_store import HostStore
+from dayu.host.protocols import ReplyOutboxStoreProtocol
+from dayu.host.reply_outbox_store import InMemoryReplyOutboxStore, SQLiteReplyOutboxStore
+
+
+def _build_submit_request(*, delivery_key: str = "wechat:run_1") -> ReplyOutboxSubmitRequest:
+    """构造最小化提交请求。
+
+    Args:
+        delivery_key: 业务幂等键。
+
+    Returns:
+        可复用的提交请求。
+
+    Raises:
+        无。
+    """
+
+    return ReplyOutboxSubmitRequest(
+        delivery_key=delivery_key,
+        session_id="session_1",
+        scene_name="wechat",
+        source_run_id="run_1",
+        reply_content="分析结论",
+        metadata={
+            "delivery_channel": "wechat",
+            "delivery_target": "user_1",
+            "delivery_thread_id": "thread_1",
+        },
+    )
+
+
+@pytest.mark.unit
+def test_in_memory_reply_outbox_submit_is_idempotent() -> None:
+    """相同 delivery_key 与负载重复提交时应幂等返回同一记录。"""
+
+    store = InMemoryReplyOutboxStore()
+
+    first = store.submit_reply(_build_submit_request())
+    second = store.submit_reply(_build_submit_request())
+
+    assert second.delivery_id == first.delivery_id
+    assert second.state == ReplyOutboxState.PENDING_DELIVERY
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_rejects_conflicting_payload_for_same_delivery_key(tmp_path: Path) -> None:
+    """相同 delivery_key 但不同负载时应拒绝覆盖真源。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+    store.submit_reply(_build_submit_request())
+
+    with pytest.raises(ValueError, match="delivery_key 已存在且负载不一致"):
+        store.submit_reply(
+            ReplyOutboxSubmitRequest(
+                delivery_key="wechat:run_1",
+                session_id="session_1",
+                scene_name="wechat",
+                source_run_id="run_1",
+                reply_content="另一个答案",
+                metadata={"delivery_channel": "wechat", "delivery_target": "user_1"},
+            )
+        )
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_concurrent_submit_same_key_is_idempotent(tmp_path: Path) -> None:
+    """SQLite 同一 delivery_key 并发提交时应幂等返回同一记录。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+
+    thread_count = 6
+    round_count = 5
+
+    for round_index in range(round_count):
+        barrier = threading.Barrier(thread_count)
+        delivery_ids: list[str] = []
+        exceptions: list[BaseException] = []
+        lock = threading.Lock()
+        delivery_key = f"wechat:run_{round_index}"
+
+        def _worker() -> None:
+            """并发提交同一个 reply outbox 幂等键。"""
+
+            try:
+                barrier.wait(timeout=5)
+                record = store.submit_reply(_build_submit_request(delivery_key=delivery_key))
+                with lock:
+                    delivery_ids.append(record.delivery_id)
+            except BaseException as exc:  # noqa: BLE001
+                with lock:
+                    exceptions.append(exc)
+
+        threads = [threading.Thread(target=_worker) for _ in range(thread_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not exceptions
+        assert len(delivery_ids) == thread_count
+        assert len(set(delivery_ids)) == 1
+
+        replies = store.list_replies(session_id="session_1", scene_name="wechat")
+        round_replies = [record for record in replies if record.delivery_key == delivery_key]
+
+        assert len(round_replies) == 1
+        assert round_replies[0].delivery_id == delivery_ids[0]
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_concurrent_submit_conflicting_payload_returns_value_error(tmp_path: Path) -> None:
+    """SQLite 同一 delivery_key 并发提交不同负载时应转化为业务冲突。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+    barrier = threading.Barrier(2)
+    success_records: list[str] = []
+    value_errors: list[ValueError] = []
+    other_exceptions: list[BaseException] = []
+    lock = threading.Lock()
+
+    def _worker(reply_content: str) -> None:
+        """并发提交相同 delivery_key 的不同 payload。"""
+
+        try:
+            barrier.wait(timeout=5)
+            record = store.submit_reply(
+                ReplyOutboxSubmitRequest(
+                    delivery_key="wechat:conflict",
+                    session_id="session_1",
+                    scene_name="wechat",
+                    source_run_id="run_1",
+                    reply_content=reply_content,
+                    metadata={
+                        "delivery_channel": "wechat",
+                        "delivery_target": "user_1",
+                        "delivery_thread_id": "thread_1",
+                    },
+                )
+            )
+            with lock:
+                success_records.append(record.delivery_id)
+        except ValueError as exc:
+            with lock:
+                value_errors.append(exc)
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                other_exceptions.append(exc)
+
+    threads = [
+        threading.Thread(target=_worker, args=("答案A",)),
+        threading.Thread(target=_worker, args=("答案B",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not other_exceptions
+    assert len(success_records) == 1
+    assert len(value_errors) == 1
+
+    replies = [record for record in store.list_replies() if record.delivery_key == "wechat:conflict"]
+
+    assert len(replies) == 1
+    assert replies[0].delivery_id == success_records[0]
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_submit_after_state_change_returns_existing_record(tmp_path: Path) -> None:
+    """记录状态变更后重复 submit 相同 payload 仍应幂等返回既有记录。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+
+    created = store.submit_reply(_build_submit_request())
+    claimed = store.claim_reply(created.delivery_id)
+    repeated = store.submit_reply(_build_submit_request())
+
+    assert repeated.delivery_id == created.delivery_id
+    assert repeated.state == ReplyOutboxState.DELIVERY_IN_PROGRESS
+    assert repeated.delivery_attempt_count == claimed.delivery_attempt_count
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_claim_fail_and_deliver_state_machine(tmp_path: Path) -> None:
+    """reply outbox 应支持 pending -> in_progress -> failed_retryable -> in_progress -> delivered。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+
+    created = store.submit_reply(_build_submit_request())
+    claimed = store.claim_reply(created.delivery_id)
+    failed = store.mark_failed(claimed.delivery_id, retryable=True, error_message="网络抖动")
+    reclaimed = store.claim_reply(failed.delivery_id)
+    delivered = store.mark_delivered(reclaimed.delivery_id)
+
+    assert claimed.state == ReplyOutboxState.DELIVERY_IN_PROGRESS
+    assert claimed.delivery_attempt_count == 1
+    assert failed.state == ReplyOutboxState.FAILED_RETRYABLE
+    assert failed.last_error_message == "网络抖动"
+    assert reclaimed.state == ReplyOutboxState.DELIVERY_IN_PROGRESS
+    assert reclaimed.delivery_attempt_count == 2
+    assert delivered.state == ReplyOutboxState.DELIVERED
+    assert delivered.delivery_attempt_count == reclaimed.delivery_attempt_count
+    assert delivered.last_error_message is None
+
+
+@pytest.mark.unit
+def test_in_memory_reply_outbox_rejects_ack_before_claim() -> None:
+    """内存版 ack 不得绕过 claim 直接完成交付。"""
+
+    store = InMemoryReplyOutboxStore()
+    created = store.submit_reply(_build_submit_request())
+
+    with pytest.raises(ValueError, match="当前状态不允许 delivered"):
+        store.mark_delivered(created.delivery_id)
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_rejects_ack_before_claim(tmp_path: Path) -> None:
+    """SQLite 版 ack 不得绕过 claim 直接完成交付。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+    created = store.submit_reply(_build_submit_request())
+
+    with pytest.raises(ValueError, match="当前状态不允许 delivered"):
+        store.mark_delivered(created.delivery_id)
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_rejects_ack_from_failed_retryable_without_reclaim(tmp_path: Path) -> None:
+    """failed_retryable 记录未经重新 claim 时不得直接 ack。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+    created = store.submit_reply(_build_submit_request())
+    claimed = store.claim_reply(created.delivery_id)
+    failed = store.mark_failed(claimed.delivery_id, retryable=True, error_message="网络抖动")
+
+    with pytest.raises(ValueError, match="当前状态不允许 delivered"):
+        store.mark_delivered(failed.delivery_id)
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_ack_is_idempotent_after_delivered(tmp_path: Path) -> None:
+    """已 delivered 的记录重复 ack 应保持幂等。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+    created = store.submit_reply(_build_submit_request())
+    claimed = store.claim_reply(created.delivery_id)
+    delivered = store.mark_delivered(claimed.delivery_id)
+
+    repeated = store.mark_delivered(delivered.delivery_id)
+
+    assert repeated.delivery_id == delivered.delivery_id
+    assert repeated.state == ReplyOutboxState.DELIVERED
+    assert repeated.delivery_attempt_count == delivered.delivery_attempt_count
+    assert repeated.last_error_message is None
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_ack_accepts_stale_in_progress_snapshot_when_already_delivered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SQLite ack 在并发场景命中已 delivered 记录时应保持幂等。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+    created = store.submit_reply(_build_submit_request())
+    claimed = store.claim_reply(created.delivery_id)
+    original_get_reply = store.get_reply
+    stale_read_count = 0
+
+    def _stale_then_actual(delivery_id: str):
+        """第一次返回陈旧 in_progress 快照，后续返回数据库真实状态。"""
+
+        nonlocal stale_read_count
+        if stale_read_count == 0:
+            stale_read_count += 1
+            return claimed
+        return original_get_reply(delivery_id)
+
+    delivered = store.mark_delivered(claimed.delivery_id)
+    monkeypatch.setattr(store, "get_reply", _stale_then_actual)
+
+    repeated = store.mark_delivered(claimed.delivery_id)
+
+    assert delivered.state == ReplyOutboxState.DELIVERED
+    assert repeated.delivery_id == delivered.delivery_id
+    assert repeated.state == ReplyOutboxState.DELIVERED
+    assert repeated.delivery_attempt_count == delivered.delivery_attempt_count
+
+
+@pytest.mark.unit
+def test_sqlite_reply_outbox_claim_rejects_stale_pending_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SQLite claim 必须在数据库层原子校验旧状态，不能接受陈旧快照。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    store = SQLiteReplyOutboxStore(host_store)
+    created = store.submit_reply(_build_submit_request())
+    claimed = store.claim_reply(created.delivery_id)
+    original_get_reply = store.get_reply
+    stale_read_count = 0
+
+    def _stale_then_actual(delivery_id: str):
+        """第一次返回陈旧 pending 快照，后续返回数据库真实状态。"""
+
+        nonlocal stale_read_count
+        if stale_read_count == 0:
+            stale_read_count += 1
+            return created
+        return original_get_reply(delivery_id)
+
+    monkeypatch.setattr(store, "get_reply", _stale_then_actual)
+
+    with pytest.raises(ValueError, match="当前状态不允许 claim"):
+        store.claim_reply(created.delivery_id)
+
+    refreshed = original_get_reply(created.delivery_id)
+
+    assert refreshed is not None
+    assert refreshed.state == ReplyOutboxState.DELIVERY_IN_PROGRESS
+    assert refreshed.delivery_attempt_count == claimed.delivery_attempt_count
+
+
+@pytest.mark.unit
+def test_reply_outbox_schema_includes_indexes(tmp_path: Path) -> None:
+    """reply outbox schema 应包含幂等键约束和 source_run_id 索引。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+    conn = host_store.get_connection()
+
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(reply_outbox)").fetchall()
+    }
+    index_columns = {
+        row["name"]: {
+            detail["name"]
+            for detail in conn.execute(f"PRAGMA index_info({row['name']})").fetchall()
+        }
+        for row in conn.execute("PRAGMA index_list(reply_outbox)").fetchall()
+    }
+
+    assert "delivery_key" in columns
+    assert "metadata_json" in columns
+    assert any({"source_run_id"} == indexed for indexed in index_columns.values())
+    assert any({"delivery_key"} == indexed for indexed in index_columns.values())
+
+
+@pytest.mark.unit
+def test_reply_outbox_store_implements_runtime_protocol(tmp_path: Path) -> None:
+    """内存版与 SQLite 版 reply outbox store 都应满足 runtime protocol。"""
+
+    host_store = HostStore(tmp_path / ".host" / "dayu_host.db")
+    host_store.initialize_schema()
+
+    assert isinstance(InMemoryReplyOutboxStore(), ReplyOutboxStoreProtocol)
+    assert isinstance(SQLiteReplyOutboxStore(host_store), ReplyOutboxStoreProtocol)

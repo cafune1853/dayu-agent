@@ -1,0 +1,891 @@
+"""CLI 依赖装配与配置解析模块。
+
+模块职责：
+- 定义 CLI 侧数据类型（``WorkspaceConfig``、``RunningConfig``、``ModelName``、``WriteCliConfig``）。
+- 解析工作区路径、日志级别、模型名称、写作配置。
+- 装配 Host 级依赖并构建 Chat / Prompt / Write / Fins 各 Service 实例。
+- 解析 write 场景模型配置。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Protocol
+
+from dayu.cli.interactive_state import (
+    FileInteractiveStateStore,
+    InteractiveSessionState,
+    build_interactive_key,
+    build_interactive_session_id,
+)
+from dayu.contracts.infrastructure import ConfigLoaderProtocol, PromptAssetStoreProtocol
+from dayu.contracts.session import SessionSource
+from dayu.contracts.toolset_config import ToolsetConfigSnapshot, build_toolset_config_snapshot
+from dayu.execution.options import (
+    ExecutionOptions,
+    ExecutionOptionsOverridePayload,
+    ResolvedExecutionOptions,
+    TraceSettings,
+    normalize_temperature,
+    resolve_doc_tool_limits_from_toolset_configs,
+    resolve_fins_tool_limits_from_toolset_configs,
+    resolve_web_tools_config_from_toolset_configs,
+)
+from dayu.execution.runtime_config import AgentRuntimeConfig, RunnerRuntimeConfig
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.storage import FsSourceDocumentRepository
+from dayu.host import resolve_host_config
+from dayu.host.host import Host
+from dayu.log import Log, LogLevel
+from dayu.services import prepare_scene_execution_acceptance_preparer, recover_host_startup_state, WriteRunConfig
+from dayu.services.host_admin_service import HostAdminService
+from dayu.services.chat_service import ChatService
+from dayu.services.fins_service import FinsService
+from dayu.services.prompt_service import PromptService
+from dayu.services.scene_execution_acceptance import SceneExecutionAcceptancePreparer
+from dayu.services.write_service import WriteService
+from dayu.services.contracts import WriteRequest
+from dayu.startup.dependencies import (
+    prepare_config_file_resolver,
+    prepare_config_loader,
+    prepare_default_execution_options,
+    prepare_fins_runtime,
+    prepare_model_catalog,
+    prepare_prompt_asset_store,
+    prepare_startup_paths,
+    prepare_workspace_resources,
+)
+from dayu.startup.workspace import WorkspaceResources
+from dayu.workspace_paths import build_interactive_state_dir
+
+
+
+MODULE = "APP.MAIN"
+
+
+_COMMANDS_ALLOW_MISSING_FILINGS_DIR = frozenset(
+    {
+        "download",
+        "interactive",
+        "prompt",
+        "upload_filing",
+        "upload_filings_from",
+        "upload_material",
+    }
+)
+
+
+def _build_toolset_override_snapshots(
+    *,
+    doc_limits: ExecutionOptionsOverridePayload | None,
+    fins_limits: ExecutionOptionsOverridePayload | None,
+) -> tuple[ToolsetConfigSnapshot, ...]:
+    """把 CLI 解析出的 limits override 收敛为通用 toolset override 快照。
+
+    Args:
+        doc_limits: 文档工具限制 override。
+        fins_limits: 财报工具限制 override。
+
+    Returns:
+        通用 toolset override 快照序列。
+
+    Raises:
+        TypeError: 当 override 无法构造成通用快照时抛出。
+        ValueError: 当 toolset 名称非法时抛出。
+    """
+
+    snapshots: list[ToolsetConfigSnapshot] = []
+    for snapshot in (
+        build_toolset_config_snapshot("doc", doc_limits),
+        build_toolset_config_snapshot("fins", fins_limits),
+    ):
+        if snapshot is not None:
+            snapshots.append(snapshot)
+    return tuple(snapshots)
+
+
+_COMMANDS_WARN_ON_MISSING_FILINGS_DIR = frozenset(
+    {
+        "interactive",
+        "prompt",
+    }
+)
+
+
+@dataclass(frozen=True)
+class WorkspaceConfig:
+    """CLI 工作区路径配置。"""
+
+    workspace_dir: Path
+    output_dir: Path
+    config_root: Path | None = None
+    ticker: str | None = None
+    has_local_filings: bool = False
+    config_loader: ConfigLoaderProtocol | None = None
+    prompt_asset_store: PromptAssetStoreProtocol | None = None
+
+
+def _has_local_filing_storage_root(workspace_dir: Path, ticker: str) -> bool:
+    """通过源文档仓储判断本地 filing 根目录是否存在。
+
+    Args:
+        workspace_dir: 工作区根目录。
+        ticker: 股票代码。
+
+    Returns:
+        若 filing 根目录存在且为目录则返回 `True`，否则返回 `False`。
+
+    Raises:
+        NotADirectoryError: filing 根路径存在但不是目录时抛出。
+        OSError: 仓储检查失败时抛出。
+    """
+
+    source_repository = FsSourceDocumentRepository(
+        workspace_dir,
+        create_directories=False,
+    )
+    return source_repository.has_source_storage_root(ticker, SourceKind.FILING)
+
+
+class _WebToolsConfigLike(Protocol):
+    """CLI 侧只关心 ``provider`` 字段的 web 配置视图。"""
+
+    @property
+    def provider(self) -> str:
+        """返回当前 web provider 名称。"""
+
+        ...
+
+
+@dataclass(frozen=True)
+class _DefaultWebToolsConfig:
+    """CLI 本地兜底的最小 web 配置快照。"""
+
+    provider: str = "auto"
+
+
+@dataclass(frozen=True)
+class RunningConfig:
+    """CLI 侧可见的运行配置快照。"""
+
+    runner_running_config: RunnerRuntimeConfig
+    agent_running_config: AgentRuntimeConfig
+    doc_tool_limits: object | None
+    fins_tool_limits: object | None
+    web_tools_config: _WebToolsConfigLike
+    tool_trace_config: TraceSettings
+    model_name: str = ""
+    temperature: float | None = None
+
+    @property
+    def trace_settings(self) -> TraceSettings:
+        """兼容 runtime 命名。"""
+
+        return self.tool_trace_config
+
+    @classmethod
+    def from_resolved(cls, resolved: ResolvedExecutionOptions) -> "RunningConfig":
+        """从 runtime 选项转换为 CLI 运行配置。"""
+
+        return cls(
+            runner_running_config=resolved.runner_running_config,
+            agent_running_config=resolved.agent_running_config,
+            doc_tool_limits=resolve_doc_tool_limits_from_toolset_configs(resolved.toolset_configs),
+            fins_tool_limits=resolve_fins_tool_limits_from_toolset_configs(resolved.toolset_configs),
+            web_tools_config=(
+                resolve_web_tools_config_from_toolset_configs(resolved.toolset_configs)
+                or _DefaultWebToolsConfig()
+            ),
+            tool_trace_config=TraceSettings(
+                enabled=resolved.trace_settings.enabled,
+                output_dir=resolved.trace_settings.output_dir,
+                max_file_bytes=resolved.trace_settings.max_file_bytes,
+                retention_days=resolved.trace_settings.retention_days,
+                compress_rolled=resolved.trace_settings.compress_rolled,
+                partition_by_session=resolved.trace_settings.partition_by_session,
+            ),
+            model_name=resolved.model_name,
+            temperature=resolved.temperature,
+        )
+
+
+@dataclass(frozen=True)
+class ModelName:
+    """模型名包装对象。"""
+
+    model_name: str
+
+
+ToolTraceConfig = TraceSettings
+
+
+@dataclass
+class WriteCliConfig:
+    """CLI 写作模式配置。"""
+
+    enabled: bool
+    template_path: Path
+    output_dir: Path
+    audit_model_override_name: str
+    write_max_retries: int
+    resume: bool
+    web_provider: str
+    chapter_filter: str = ""
+    fast: bool = False
+    force: bool = False
+    infer: bool = False
+
+
+def _build_execution_options(args: argparse.Namespace) -> ExecutionOptions:
+    """从 CLI 参数构建请求级执行选项。
+
+    Args:
+        args: 命令行参数对象。
+
+    Returns:
+        执行选项对象。
+
+    Raises:
+        SystemExit: limits JSON 非法时退出。
+    """
+
+    doc_limits = _parse_limits_override(
+        getattr(args, "doc_limits_json", None),
+        field_name="--doc-limits-json",
+    )
+    fins_limits = _parse_limits_override(
+        getattr(args, "fins_limits_json", None),
+        field_name="--fins-limits-json",
+    )
+
+    return ExecutionOptions(
+        model_name=(raw_model_name if (raw_model_name := str(getattr(args, "model_name", "") or "").strip()) else None),
+        temperature=_parse_temperature_argument(getattr(args, "temperature", None), field_name="--temperature"),
+        debug_sse=bool(getattr(args, "debug_sse", False)),
+        debug_tool_delta=bool(getattr(args, "debug_tool_delta", False)),
+        debug_sse_sample_rate=getattr(args, "debug_sse_sample_rate", None),
+        debug_sse_throttle_sec=getattr(args, "debug_sse_throttle_sec", None),
+        tool_timeout_seconds=getattr(args, "tool_timeout_seconds", None),
+        max_iterations=getattr(args, "max_iterations", None),
+        fallback_mode=getattr(args, "fallback_mode", None),
+        fallback_prompt=getattr(args, "fallback_prompt", None),
+        max_consecutive_failed_tool_batches=getattr(args, "max_consecutive_failed_tool_batches", None),
+        max_duplicate_tool_calls=getattr(args, "max_duplicate_tool_calls", None),
+        duplicate_tool_hint_prompt=getattr(args, "duplicate_tool_hint_prompt", None),
+        web_provider=getattr(args, "web_provider", None),
+        trace_enabled=(True if bool(getattr(args, "enable_tool_trace", False)) else None),
+        trace_output_dir=Path(getattr(args, "tool_trace_dir")).expanduser().resolve()
+        if getattr(args, "tool_trace_dir", None)
+        else None,
+        toolset_config_overrides=_build_toolset_override_snapshots(
+            doc_limits=doc_limits,
+            fins_limits=fins_limits,
+        ),
+    )
+
+
+def _build_interactive_state_store(workspace_dir: Path) -> FileInteractiveStateStore:
+    """构造 interactive 状态仓储。
+
+    Args:
+        workspace_dir: 工作区根目录。
+
+    Returns:
+        interactive 状态仓储。
+
+    Raises:
+        无。
+    """
+
+    return FileInteractiveStateStore(build_interactive_state_dir(workspace_dir))
+
+
+def _resolve_interactive_session_id(workspace_dir: Path, *, new_session: bool) -> str:
+    """解析 interactive 启动时应绑定的 session_id。
+
+    Args:
+        workspace_dir: 工作区根目录。
+        new_session: 是否显式要求开启新会话。
+
+    Returns:
+        供 interactive 使用的确定性 session_id。
+
+    Raises:
+        ValueError: 当状态文件损坏时抛出。
+    """
+
+    store = _build_interactive_state_store(workspace_dir)
+    if new_session:
+        Log.info("开启新会话，清理旧会话绑定", module=MODULE)
+        store.clear()
+    state = store.load()
+    if state is None:
+        state = InteractiveSessionState(interactive_key=build_interactive_key())
+        store.save(state)
+    return build_interactive_session_id(state.interactive_key)
+
+
+def setup_paths(args: argparse.Namespace) -> WorkspaceConfig:
+    """处理并验证工作区路径。
+
+    Args:
+        args: 命令行参数对象。
+
+    Returns:
+        CLI 工作区路径配置。
+
+    Raises:
+        SystemExit: 路径非法时退出。
+    """
+
+    workspace_dir = Path(args.base).expanduser().resolve()
+    if not workspace_dir.exists():
+        Log.error(f"输入目录不存在: {workspace_dir}", module=MODULE)
+        raise SystemExit(1)
+    if not workspace_dir.is_dir():
+        Log.error(f"输入路径不是目录: {workspace_dir}", module=MODULE)
+        raise SystemExit(1)
+
+    raw_config_root = getattr(args, "config", None)
+    config_root = Path(raw_config_root).expanduser().resolve() if raw_config_root else None
+    output_dir = (workspace_dir / "output").resolve()
+
+    raw_ticker = getattr(args, "ticker", None)
+    ticker = str(raw_ticker).strip().upper() if raw_ticker else None
+    has_local_filings = False
+    command_name = str(getattr(args, "command", "") or "").strip()
+    if ticker:
+        try:
+            has_local_filings = _has_local_filing_storage_root(workspace_dir, ticker)
+        except NotADirectoryError as exc:
+            Log.error(f"财报目录不是目录: {exc}", module=MODULE)
+            raise SystemExit(1) from exc
+        except OSError as exc:
+            Log.error(f"财报目录检查失败: ticker={ticker}, error={exc}", module=MODULE)
+            raise SystemExit(1) from exc
+        if not has_local_filings and command_name not in _COMMANDS_ALLOW_MISSING_FILINGS_DIR:
+            Log.error(f"财报目录不存在: ticker={ticker}", module=MODULE)
+            raise SystemExit(1)
+        if not has_local_filings and command_name in _COMMANDS_WARN_ON_MISSING_FILINGS_DIR:
+            Log.warning(f"财报目录不存在，将按无本地财报继续: ticker={ticker}", module=MODULE)
+
+    return WorkspaceConfig(
+        workspace_dir=workspace_dir,
+        config_root=config_root,
+        output_dir=output_dir,
+        ticker=ticker,
+        has_local_filings=has_local_filings,
+    )
+
+
+def _parse_limits_override(
+    raw_json: str | None,
+    *,
+    field_name: str,
+) -> ExecutionOptionsOverridePayload | None:
+    """解析 limits 覆盖 JSON 字符串。
+
+    Args:
+        raw_json: 原始 JSON 字符串。
+        field_name: 字段名，仅用于错误提示。
+
+    Returns:
+        解析后的字典；输入为空时返回 ``None``。
+
+    Raises:
+        SystemExit: JSON 非法或不是对象时退出。
+    """
+
+    if raw_json is None:
+        return None
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        Log.error(f"{field_name} 不是合法 JSON: {exc}", module=MODULE)
+        raise SystemExit(2) from exc
+    if not isinstance(parsed, dict):
+        Log.error(f"{field_name} 必须是 JSON 对象", module=MODULE)
+        raise SystemExit(2)
+    normalized: ExecutionOptionsOverridePayload = {}
+    for key, value in parsed.items():
+        if value is None or isinstance(value, str | int | float | bool):
+            normalized[str(key)] = value
+            continue
+        Log.error(f"{field_name} 只允许 JSON 标量值，字段 {key!r} 非法", module=MODULE)
+        raise SystemExit(2)
+    return normalized
+
+
+def _parse_temperature_argument(raw_value: str | int | float | None, *, field_name: str) -> float | None:
+    """解析 CLI temperature 参数。
+
+    Args:
+        raw_value: 原始参数值。
+        field_name: 参数名，仅用于错误提示。
+
+    Returns:
+        标准化后的 temperature；未传时返回 ``None``。
+
+    Raises:
+        SystemExit: 当 temperature 非法时退出。
+    """
+
+    try:
+        return normalize_temperature(raw_value, field_name=field_name)
+    except ValueError as exc:
+        Log.error(str(exc), module=MODULE)
+        raise SystemExit(2) from exc
+
+
+def load_running_config(args, paths_config: WorkspaceConfig) -> RunningConfig:
+    """通过启动期依赖解析并返回默认执行选项。
+
+    Args:
+        args: 命令行参数对象。
+        paths_config: 已解析的工作区路径配置。
+
+    Returns:
+        CLI 可见的运行配置快照。
+
+    Raises:
+        无。
+    """
+
+    default_execution_options = _prepare_cli_default_execution_options(
+        workspace_config=paths_config,
+        execution_options=_build_execution_options(args),
+    )
+    return RunningConfig.from_resolved(default_execution_options)
+
+
+def _resolve_tool_trace_output_dir(raw_output_dir: str, workspace_dir: Path) -> Path:
+    """解析工具追踪输出目录。
+
+    Args:
+        raw_output_dir: 配置中的目录字符串。
+        workspace_dir: 工作区根目录。
+
+    Returns:
+        规范化后的绝对路径。
+
+    Raises:
+        无。
+    """
+
+    candidate = Path(raw_output_dir).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return (workspace_dir / candidate).resolve()
+
+
+def _build_scene_execution_options(
+    *,
+    execution_options: ExecutionOptions | None,
+    model_name: str,
+) -> ExecutionOptions | None:
+    """为指定 scene 构建模型覆盖后的执行选项。
+
+    Args:
+        execution_options: 原始请求级执行选项。
+        model_name: 目标模型名；为空时表示不注入请求级模型覆盖。
+
+    Returns:
+        适用于该 scene 的执行选项。
+
+    Raises:
+        无。
+    """
+
+    normalized_model_name = str(model_name or "").strip()
+    stripped_options = execution_options
+    if stripped_options is not None:
+        stripped_options = replace(stripped_options, model_name=None)
+    if not normalized_model_name:
+        return stripped_options
+    if stripped_options is None:
+        return ExecutionOptions(model_name=normalized_model_name)
+    return replace(stripped_options, model_name=normalized_model_name)
+
+
+
+
+def _prepare_cli_default_execution_options(
+    *,
+    workspace_config: WorkspaceConfig,
+    execution_options: ExecutionOptions | None,
+) -> ResolvedExecutionOptions:
+    """准备 CLI 默认执行基线。
+
+    Args:
+        workspace_config: 工作区路径配置。
+        execution_options: 请求级执行选项。
+
+    Returns:
+        解析后的默认执行选项。
+
+    Raises:
+        无。
+    """
+
+    paths = prepare_startup_paths(
+        workspace_root=workspace_config.workspace_dir,
+        config_root=workspace_config.config_root,
+    )
+    resolver = prepare_config_file_resolver(config_root=paths.config_root)
+    config_loader = prepare_config_loader(resolver=resolver)
+    return prepare_default_execution_options(
+        workspace_root=paths.workspace_root,
+        config_loader=config_loader,
+        execution_options=execution_options,
+    )
+
+
+def _prepare_cli_host_dependencies(
+    *,
+    workspace_config: WorkspaceConfig,
+    execution_options: ExecutionOptions | None,
+) -> tuple[
+    WorkspaceResources,
+    ResolvedExecutionOptions,
+    SceneExecutionAcceptancePreparer,
+    Host,
+    DefaultFinsRuntime,
+]:
+    """准备 CLI 的 Host 级稳定依赖。
+
+    Args:
+        workspace_config: 工作区路径配置。
+        execution_options: 请求级执行选项。
+
+    Returns:
+        `(
+            workspace,
+            default_execution_options,
+            scene_execution_acceptance_preparer,
+            host,
+            fins_runtime,
+        )`。
+
+    Raises:
+        无。
+    """
+
+    paths = prepare_startup_paths(
+        workspace_root=workspace_config.workspace_dir,
+        config_root=workspace_config.config_root,
+    )
+    resolver = prepare_config_file_resolver(config_root=paths.config_root)
+    config_loader = prepare_config_loader(resolver=resolver)
+    prompt_asset_store = prepare_prompt_asset_store(resolver=resolver)
+    workspace = prepare_workspace_resources(
+        paths=paths,
+        config_loader=config_loader,
+        prompt_asset_store=prompt_asset_store,
+    )
+    model_catalog = prepare_model_catalog(config_loader=config_loader)
+    default_execution_options = prepare_default_execution_options(
+        workspace_root=paths.workspace_root,
+        config_loader=config_loader,
+        execution_options=execution_options,
+    )
+    scene_execution_acceptance_preparer = prepare_scene_execution_acceptance_preparer(
+        workspace_root=paths.workspace_root,
+        default_execution_options=default_execution_options,
+        model_catalog=model_catalog,
+        prompt_asset_store=prompt_asset_store,
+    )
+    fins_runtime = prepare_fins_runtime(workspace_root=paths.workspace_root)
+    run_config = config_loader.load_run_config()
+    host_config = resolve_host_config(
+        workspace_root=paths.workspace_root,
+        run_config=run_config,
+        explicit_lane_config=None,
+    )
+    host = Host(
+        workspace=workspace,
+        model_catalog=model_catalog,
+        default_execution_options=default_execution_options,
+        host_store_path=host_config.store_path,
+        lane_config=host_config.lane_config,
+        pending_turn_resume_max_attempts=host_config.pending_turn_resume_max_attempts,
+        event_bus=None,
+    )
+    recover_host_startup_state(
+        HostAdminService(host=host),
+        runtime_label="CLI Host runtime",
+        log_module=MODULE,
+    )
+    return (
+        workspace,
+        default_execution_options,
+        scene_execution_acceptance_preparer,
+        host,
+        fins_runtime,
+    )
+
+
+def _build_chat_service(
+    *,
+    host: Host,
+    scene_execution_acceptance_preparer: SceneExecutionAcceptancePreparer,
+    fins_runtime: DefaultFinsRuntime,
+) -> ChatService:
+    """构建交互聊天服务。
+
+    Args:
+        host: 宿主对象。
+        scene_execution_acceptance_preparer: scene 执行参数接受器。
+        fins_runtime: 财报运行时。
+
+    Returns:
+        聊天服务实例。
+
+    Raises:
+        无。
+    """
+
+    return ChatService(
+        host=host,
+        scene_execution_acceptance_preparer=scene_execution_acceptance_preparer,
+        company_name_resolver=fins_runtime.get_company_name,
+        session_source=SessionSource.CLI,
+    )
+
+
+def _build_prompt_service(
+    *,
+    host: Host,
+    scene_execution_acceptance_preparer: SceneExecutionAcceptancePreparer,
+    fins_runtime: DefaultFinsRuntime,
+) -> PromptService:
+    """构建单轮 prompt 服务。
+
+    Args:
+        host: 宿主对象。
+        scene_execution_acceptance_preparer: scene 执行参数接受器。
+        fins_runtime: 财报运行时。
+
+    Returns:
+        prompt 服务实例。
+
+    Raises:
+        无。
+    """
+
+    return PromptService(
+        host=host,
+        scene_execution_acceptance_preparer=scene_execution_acceptance_preparer,
+        company_name_resolver=fins_runtime.get_company_name,
+        session_source=SessionSource.CLI,
+    )
+
+
+def _build_write_service(
+    *,
+    host: Host,
+    workspace: WorkspaceResources,
+    scene_execution_acceptance_preparer: SceneExecutionAcceptancePreparer,
+    fins_runtime: DefaultFinsRuntime,
+) -> WriteService:
+    """构建写作服务。
+
+    Args:
+        host: 宿主对象。
+        workspace: 工作区稳定资源。
+        scene_execution_acceptance_preparer: scene 执行参数接受器。
+        fins_runtime: 财报运行时。
+
+    Returns:
+        写作服务实例。
+
+    Raises:
+        无。
+    """
+
+    return WriteService(
+        host=host,
+        workspace=workspace,
+        scene_execution_acceptance_preparer=scene_execution_acceptance_preparer,
+        company_name_resolver=fins_runtime.get_company_name,
+        company_meta_summary_resolver=fins_runtime.get_company_meta_summary,
+    )
+
+
+def _build_fins_ops_service(args: argparse.Namespace) -> FinsService:
+    """构建财报服务。
+
+    Args:
+        args: 命令行参数对象。
+
+    Returns:
+        财报服务实例。
+
+    Raises:
+        无。
+    """
+
+    workspace_config = setup_paths(args)
+    (
+        _workspace,
+        _default_execution_options,
+        _scene_execution_acceptance_preparer,
+        host,
+        fins_runtime,
+    ) = _prepare_cli_host_dependencies(
+        workspace_config=workspace_config,
+        execution_options=None,
+    )
+    return FinsService(
+        host=host,
+        fins_runtime=fins_runtime,
+        session_source=SessionSource.CLI,
+    )
+
+
+def setup_model_name(args) -> ModelName:
+    """
+    构建模型配置（从 CLI 获取）
+
+    Args:
+        args: 命令行参数对象
+
+    Returns:
+        ModelConfig: 模型配置对象
+    """
+    return ModelName(model_name=str(getattr(args, "model_name", "") or "").strip())
+
+
+def setup_write_config(args, paths_config: WorkspaceConfig, running_config: RunningConfig) -> WriteCliConfig:
+    """构建写作模式配置。
+
+    Args:
+        args: 命令行参数对象。
+        paths_config: 路径配置对象。
+        running_config: 运行时配置对象，用于读取 `web_tools_config` 默认值。
+
+    Returns:
+        `WriteCliConfig` 写作配置对象。
+
+    Raises:
+        SystemExit: 当写作参数非法时退出。
+    """
+
+    raw_output = getattr(args, "output", None)
+    raw_template = getattr(args, "template", "./定性分析模板.md")
+    raw_write_max_retries = int(getattr(args, "write_max_retries", 2))
+    raw_resume = bool(getattr(args, "resume", True))
+    raw_web_provider = getattr(args, "web_provider", None)
+    raw_audit_model_name = str(getattr(args, "audit_model_name", "") or "").strip()
+    raw_chapter_filter = str(getattr(args, "chapter", None) or "")
+    raw_fast = bool(getattr(args, "fast", False))
+    raw_force = bool(getattr(args, "force", False))
+    raw_infer = bool(getattr(args, "infer", False))
+
+    output_dir = _resolve_write_output_dir(
+        workspace_dir=paths_config.workspace_dir,
+        ticker=paths_config.ticker,
+        raw_output=raw_output,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    template_path = Path(raw_template).expanduser()
+    if not template_path.is_absolute():
+        template_path = (Path.cwd() / template_path).resolve()
+    if not template_path.exists() or not template_path.is_file():
+        Log.error(f"模板文件不存在: {template_path}", module=MODULE)
+        raise SystemExit(2)
+
+    if raw_write_max_retries < 0:
+        Log.error("--write-max-retries 不能为负数", module=MODULE)
+        raise SystemExit(2)
+
+    return WriteCliConfig(
+        enabled=(args.command == "write"),
+        template_path=template_path,
+        output_dir=output_dir,
+        audit_model_override_name=raw_audit_model_name,
+        write_max_retries=raw_write_max_retries,
+        resume=raw_resume,
+        web_provider=str(raw_web_provider or running_config.web_tools_config.provider),
+        chapter_filter=raw_chapter_filter,
+        fast=raw_fast,
+        force=raw_force,
+        infer=raw_infer,
+    )
+
+
+def _resolve_write_output_dir(*, workspace_dir: Path, ticker: str | None, raw_output: str | None) -> Path:
+    """解析写作相关命令的输出目录。
+
+    Args:
+        workspace_dir: 工作区根目录。
+        ticker: 当前股票代码；存在时默认落到 `draft/{ticker}`。
+        raw_output: CLI 显式传入的输出目录。
+
+    Returns:
+        规范化后的输出目录绝对路径。
+
+    Raises:
+        无。
+    """
+
+    if raw_output is not None:
+        return Path(raw_output).expanduser().resolve()
+    default_output_dir = (workspace_dir / "draft").resolve()
+    if ticker:
+        return (default_output_dir / ticker).resolve()
+    return default_output_dir
+
+
+def setup_loglevel(args):
+    """根据命令行参数设置日志级别。
+
+    Args:
+        args: argparse 解析结果对象。
+
+    Returns:
+        无。
+
+    Raises:
+        KeyError: 传入未知日志级别名称时抛出。
+    """
+
+    if args.log_level:
+        Log.set_level(LogLevel[args.log_level.upper()])
+    elif args.debug:
+        Log.set_level(LogLevel.DEBUG)
+    elif args.verbose:
+        Log.set_level(LogLevel.VERBOSE)
+    elif args.info:
+        Log.set_level(LogLevel.INFO)
+    elif args.quiet:
+        Log.set_level(LogLevel.ERROR)
+    else:
+        # 即使无显式 flag，也需调用 set_level 以触发第三方库抑制逻辑
+        Log.set_level(LogLevel.INFO)
+
+
+def run_write_pipeline(
+    *,
+    write_config: WriteRunConfig,
+    write_service: WriteService | None = None,
+) -> int:
+    """执行写作流水线入口。
+
+    Args:
+        write_config: 写作配置对象。
+        write_service: 预装配写作服务。
+
+    Returns:
+        流水线退出码。
+
+    Raises:
+        RuntimeError: 写作执行异常时透传。
+    """
+
+    if write_service is None:
+        raise ValueError("run_write_pipeline 需要注入 write_service")
+    return write_service.run(WriteRequest(write_config=write_config))

@@ -1,0 +1,250 @@
+"""SessionRegistry 的 SQLite 实现。
+
+基于 HostStore 提供跨进程可见的 session 生命周期管理。
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from dayu.host.host_store import HostStore
+from dayu.host.protocols import SessionRegistryProtocol
+from dayu.contracts.session import SessionRecord, SessionSource, SessionState
+from dayu.log import Log
+
+MODULE = "HOST.SESSION_REGISTRY"
+
+
+def _now_utc() -> datetime:
+    """返回当前 UTC 时间。"""
+
+    return datetime.now(timezone.utc)
+
+
+def _serialize_dt(dt: datetime) -> str:
+    """将 datetime 序列化为 ISO 8601 字符串。"""
+
+    return dt.isoformat()
+
+
+def _parse_dt(text: str) -> datetime:
+    """将 ISO 8601 字符串解析为 datetime。"""
+
+    return datetime.fromisoformat(text)
+
+
+def _row_to_record(row: dict[str, Any]) -> SessionRecord:
+    """将 SQLite 行记录转换为 SessionRecord。
+
+    Args:
+        row: SQLite 行（dict 模式）。
+
+    Returns:
+        SessionRecord 实例。
+    """
+
+    raw_metadata = row["metadata_json"]
+    metadata = json.loads(raw_metadata) if raw_metadata else {}
+    return SessionRecord(
+        session_id=row["session_id"],
+        source=SessionSource(row["source"]),
+        state=SessionState(row["state"]),
+        scene_name=row["scene_name"],
+        created_at=_parse_dt(row["created_at"]),
+        last_activity_at=_parse_dt(row["last_activity_at"]),
+        metadata=metadata,
+    )
+
+
+class SQLiteSessionRegistry(SessionRegistryProtocol):
+    """基于 SQLite 的 SessionRegistry 实现。
+
+    所有操作通过 HostStore.get_connection() 执行 SQL，
+    支持跨进程可见性（SQLite WAL 模式）。
+    """
+
+    def __init__(self, host_store: HostStore) -> None:
+        """初始化 SessionRegistry。
+
+        Args:
+            host_store: 共享 SQLite 存储。
+        """
+
+        self._host_store = host_store
+
+    def create_session(
+        self,
+        source: SessionSource,
+        *,
+        session_id: str | None = None,
+        scene_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionRecord:
+        """创建新 session。"""
+
+        sid = session_id or uuid.uuid4().hex
+        now = _now_utc()
+        now_str = _serialize_dt(now)
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+
+        conn = self._host_store.get_connection()
+        conn.execute(
+            """
+            INSERT INTO sessions (session_id, source, state, scene_name,
+                                  created_at, last_activity_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (sid, source.value, SessionState.ACTIVE.value, scene_name, now_str, now_str, metadata_json),
+        )
+        conn.commit()
+
+        Log.debug(
+            f"创建 session: session_id={sid}, source={source.value}, scene_name={scene_name or ''}",
+            module=MODULE,
+        )
+
+        return SessionRecord(
+            session_id=sid,
+            source=source,
+            state=SessionState.ACTIVE,
+            scene_name=scene_name,
+            created_at=now,
+            last_activity_at=now,
+            metadata=metadata or {},
+        )
+
+    def ensure_session(
+        self,
+        session_id: str,
+        source: SessionSource,
+        *,
+        scene_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionRecord:
+        """幂等获取或创建 session。"""
+
+        now = _now_utc()
+        now_str = _serialize_dt(now)
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+
+        conn = self._host_store.get_connection()
+        # INSERT OR IGNORE：存在则忽略，不存在则插入
+        existing = self.get_session(session_id)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO sessions
+                (session_id, source, state, scene_name,
+                 created_at, last_activity_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, source.value, SessionState.ACTIVE.value, scene_name, now_str, now_str, metadata_json),
+        )
+        # 无论是否新插入，都 touch last_activity_at
+        conn.execute(
+            "UPDATE sessions SET last_activity_at = ? WHERE session_id = ?",
+            (now_str, session_id),
+        )
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        Log.debug(
+            f"ensure session: session_id={session_id}, source={source.value}, existed={existing is not None}",
+            module=MODULE,
+        )
+        return _row_to_record(dict(row))
+
+    def get_session(self, session_id: str) -> SessionRecord | None:
+        """查询单个 session。"""
+
+        conn = self._host_store.get_connection()
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_record(dict(row))
+
+    def list_sessions(
+        self,
+        *,
+        state: SessionState | None = None,
+    ) -> list[SessionRecord]:
+        """列出 sessions，可选按状态过滤。"""
+
+        conn = self._host_store.get_connection()
+        if state is not None:
+            rows = conn.execute(
+                "SELECT * FROM sessions WHERE state = ? ORDER BY created_at DESC",
+                (state.value,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM sessions ORDER BY created_at DESC",
+            ).fetchall()
+        return [_row_to_record(dict(row)) for row in rows]
+
+    def touch_session(self, session_id: str) -> None:
+        """更新 session 最后活跃时间。"""
+
+        conn = self._host_store.get_connection()
+        cursor = conn.execute(
+            "UPDATE sessions SET last_activity_at = ? WHERE session_id = ?",
+            (_serialize_dt(_now_utc()), session_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise KeyError(f"session 不存在: {session_id}")
+        Log.debug(f"刷新 session 活跃时间: session_id={session_id}", module=MODULE)
+
+    def close_session(self, session_id: str) -> None:
+        """关闭 session。"""
+
+        conn = self._host_store.get_connection()
+        cursor = conn.execute(
+            "UPDATE sessions SET state = ? WHERE session_id = ?",
+            (SessionState.CLOSED.value, session_id),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise KeyError(f"session 不存在: {session_id}")
+        Log.info(f"关闭 session: session_id={session_id}", module=MODULE)
+
+    def close_idle_sessions(self, idle_threshold: timedelta) -> list[str]:
+        """关闭超过空闲阈值的活跃 session。"""
+
+        cutoff = _now_utc() - idle_threshold
+        cutoff_str = _serialize_dt(cutoff)
+
+        conn = self._host_store.get_connection()
+        rows = conn.execute(
+            """
+            SELECT session_id FROM sessions
+            WHERE state = ? AND last_activity_at < ?
+            """,
+            (SessionState.ACTIVE.value, cutoff_str),
+        ).fetchall()
+
+        closed_ids = [row["session_id"] for row in rows]
+        if closed_ids:
+            placeholders = ",".join("?" for _ in closed_ids)
+            conn.execute(
+                f"UPDATE sessions SET state = ? WHERE session_id IN ({placeholders})",  # noqa: S608
+                [SessionState.CLOSED.value, *closed_ids],
+            )
+            conn.commit()
+            Log.info(
+                f"关闭空闲 session: count={len(closed_ids)}, session_ids={','.join(closed_ids)}",
+                module=MODULE,
+            )
+
+        return closed_ids
+
+
+__all__ = ["SQLiteSessionRegistry"]

@@ -1,0 +1,43 @@
+prompt_name: write_chapter
+version: v1
+inputs:
+  - name: chapter
+    type: scalar
+    required: true
+    description: 当前章节标题
+  - name: company
+    type: scalar
+    required: true
+    description: 公司名称
+  - name: ticker
+    type: scalar
+    required: true
+    description: 股票代码
+  - name: company_facets_summary
+    type: markdown_block
+    required: true
+    description: 公司业务类型与关键约束摘要
+  - name: report_goal
+    type: scalar
+    required: true
+    description: 全文总目标
+  - name: audience_profile
+    type: scalar
+    required: true
+    description: 全局读者画像
+  - name: chapter_goal
+    type: scalar
+    required: true
+    description: 本章回答的总目标
+  - name: skeleton
+    type: markdown_block
+    required: true
+    description: 去除 HTML 注释后的章节骨架
+  - name: chapter_contract
+    type: json_block
+    required: true
+    description: 本章合同 JSON 对象
+  - name: item_rules
+    type: json_block
+    required: false
+    description: 局部条件写作规则列表

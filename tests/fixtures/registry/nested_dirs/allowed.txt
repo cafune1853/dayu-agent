@@ -1,0 +1,4 @@
+This file is at the top level of nested directories.
+It should be accessible when the parent directory is registered.
+
+Content: Public accessible data

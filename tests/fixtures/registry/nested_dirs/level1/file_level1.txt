@@ -1,0 +1,4 @@
+This file is in level1 subdirectory.
+It tests recursive directory access.
+
+Content: Level 1 data

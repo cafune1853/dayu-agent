@@ -1,0 +1,1444 @@
+"""
+异步 Agent - 负责推理循环与事件聚合
+
+提供统一的异步接口，屏蔽 Runner 差异，负责：
+- 构造系统/用户消息，驱动多轮推理
+- 处理工具调用批次，按顺序回填 tool messages
+- 管理迭代上限与降级策略，产出 final_answer
+- 透传 Runner 事件流，供调用者实时消费
+
+核心特性:
+- 无状态执行：每次 run() 独立构造 messages
+- 支持多轮会话：可直接传入外部维护的 messages
+- 工具调用闭环：等待 TOOL_CALLS_BATCH_DONE 后回填
+- 降级策略：达到迭代上限后移除工具能力并强制回答
+- 事件对齐：内容/工具/错误事件顺序与 Runner 规范一致
+
+主要入口:
+1. run(prompt, system_prompt="", session_id=None, stream=True, **extra_payloads) -> AsyncIterator[StreamEvent]
+2. run_messages(messages, session_id=None, stream=True, **extra_payloads) -> AsyncIterator[StreamEvent]
+3. run_and_wait(prompt, system_prompt="", session_id=None, **extra_payloads) -> AgentResult
+重要事件:
+- content_delta / content_complete: 文本输出
+- tool_call_dispatched / tool_call_result / tool_calls_batch_done: 工具调用闭环
+- final_answer: 该轮推理结束（含 degraded 标记）
+"""
+
+import copy
+import json
+import uuid
+from threading import Lock
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Tuple, cast
+
+from dataclasses import dataclass
+
+from dayu.contracts.agent_types import (
+    AgentMessage,
+    AgentTraceIdentity,
+    ToolCallPayload,
+    build_assistant_chat_message,
+    build_system_chat_message,
+    build_tool_chat_message,
+    build_user_chat_message,
+)
+from .duplicate_call_guard import DuplicateCallGuard
+from .context_budget import ContextBudgetState, PREDICTIVE_OVERHEAD_TOKENS, ToolResultBudgetCapper
+from .events import (
+    EventType,
+    StreamEvent,
+    error_event,
+    final_answer_event,
+    warning_event,
+)
+
+MODULE = "ENGINE.ASYNC_AGENT"
+from .protocols import AsyncRunner, ToolExecutor
+from dayu.log import Log
+from .tool_contracts import DupCallSpec
+from .tool_result import (
+    is_tool_success,
+    project_for_llm,
+)
+from .cancellation import CancellationToken
+from .tool_trace import ToolTraceRecorder, ToolTraceRecorderFactory
+
+DEFAULT_FALLBACK_PROMPT = (
+    "Based on the information gathered, answer the question directly. "
+    "Do not fabricate if information is insufficient."
+)
+DEFAULT_DUPLICATE_TOOL_HINT_PROMPT = (
+    "You just called the same tool ({{tool_name}}) with identical parameters. "
+    "Reuse the existing results first. Only call a tool again if you clearly "
+    "need new information, and provide your conclusion promptly."
+)
+_RESERVED_EXTRA_PAYLOAD_KEYS = frozenset({"session_id", "run_id", "iteration_id", "trace_context"})
+
+
+def _validate_extra_payload_keys(extra_payloads: Dict[str, Any]) -> None:
+    """校验外部透传参数中是否包含内部保留字段。
+
+    Args:
+        extra_payloads: 调用方传入的额外透传参数。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 当调用方试图注入内部保留字段时抛出。
+    """
+
+    duplicated_keys = sorted(_RESERVED_EXTRA_PAYLOAD_KEYS.intersection(extra_payloads.keys()))
+    if duplicated_keys:
+        duplicated = ", ".join(duplicated_keys)
+        raise ValueError(f"extra_payloads 包含内部保留字段: {duplicated}")
+DEFAULT_CONTINUATION_PROMPT = (
+    "Your previous response was truncated (finish_reason=length). "
+    "Continue from where you left off without repeating content already produced."
+)
+DEFAULT_COMPACTION_SUMMARY_HEADER = "[Context Compaction Summary]"
+DEFAULT_COMPACTION_SUMMARY_INSTRUCTION = (
+    "Continue reasoning based on recent context. "
+    "Avoid repeating tool calls that have already been completed."
+)
+
+# 压缩中保留的最近 message 条数（system 和首条 user 单独保留）
+_COMPACT_RECENT_KEEP = 6
+
+
+def _normalize_system_prompt(system_prompt: Optional[str]) -> str:
+    """规范化系统提示词文本。
+
+    Args:
+        system_prompt: 调用方传入的系统提示词。
+
+    Returns:
+        去除首尾空白后的系统提示词；为空时返回空字符串。
+
+    Raises:
+        无。
+    """
+
+    return (system_prompt or "").strip()
+
+
+def _build_messages_from_prompt(
+    *,
+    prompt: str,
+    system_prompt: Optional[str],
+) -> List[AgentMessage]:
+    """根据单轮输入构建 messages。
+
+    Args:
+        prompt: 用户输入。
+        system_prompt: 可选系统提示词。
+
+    Returns:
+        可直接传给 Runner 的 messages 列表。
+
+    Raises:
+        无。
+    """
+
+    messages: List[AgentMessage] = []
+    normalized_system_prompt = _normalize_system_prompt(system_prompt)
+    if normalized_system_prompt:
+        messages.append(build_system_chat_message(normalized_system_prompt))
+    messages.append(build_user_chat_message(prompt))
+    return messages
+
+
+def _build_tool_trace_budget_snapshot(
+    *,
+    budget_state: ContextBudgetState,
+    iteration: int,
+    max_iterations: int,
+) -> Dict[str, Any]:
+    """构建 trace 使用的预算快照。
+
+    Args:
+        budget_state: 当前上下文预算状态。
+        iteration: 当前已完成轮次数。
+        max_iterations: 最大工具调用轮次预算。
+
+    Returns:
+        预算快照字典。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "max_context_tokens": budget_state.max_context_tokens,
+        "current_prompt_tokens": budget_state.current_prompt_tokens,
+        "total_prompt_tokens": budget_state.total_prompt_tokens,
+        "total_completion_tokens": budget_state.total_completion_tokens,
+        "iteration_count": budget_state.iteration_count,
+        "compaction_count": budget_state.compaction_count,
+        "continuation_count": budget_state.continuation_count,
+        "is_over_soft_limit": budget_state.is_over_soft_limit,
+        "tool_call_budget": max_iterations,
+        "tool_calls_remaining": max(0, max_iterations - iteration),
+    }
+
+
+def _normalize_trace_identity(trace_identity: Optional[AgentTraceIdentity]) -> dict[str, str]:
+    """规范化 trace 身份元数据。
+
+    Args:
+        trace_identity: 调用方传入的 trace 身份元数据。
+
+    Returns:
+        只包含允许字段的规范化字典。
+
+    Raises:
+        无。
+    """
+
+    if trace_identity is None:
+        return {}
+    return trace_identity.to_metadata()
+
+
+@dataclass
+class AgentRunningConfig:
+    """Agent 运行时控制参数。"""
+
+    # 单次 run 最多允许的工具调用轮次；16 轮足够覆盖绝大多数财报分析任务
+    # （实测 p99 在 10 轮以内），同时防止 LLM 进入无限工具循环。
+    max_iterations: int = 16
+    fallback_mode: Literal["force_answer", "raise_error"] = "force_answer"
+    fallback_prompt: Optional[str] = DEFAULT_FALLBACK_PROMPT
+    duplicate_tool_hint_prompt: Optional[str] = DEFAULT_DUPLICATE_TOOL_HINT_PROMPT
+    continuation_prompt: Optional[str] = DEFAULT_CONTINUATION_PROMPT
+    compaction_summary_header: str = DEFAULT_COMPACTION_SUMMARY_HEADER
+    compaction_summary_instruction: str = DEFAULT_COMPACTION_SUMMARY_INSTRUCTION
+    # 连续失败 2 批即终止——连续失败通常意味着工具本身不可用或参数系统性错误，
+    # 继续重试只会浪费 token。
+    max_consecutive_failed_tool_batches: int = 2
+    # 同一工具+参数组合重复调用 2 次即触发 hard stop——第 1 次 hint 提醒，
+    # 第 2 次强制终止，避免 LLM 陷入"反复调相同工具"的死循环。
+    max_duplicate_tool_calls: int = 2
+    # 上下文预算治理参数（max_context_tokens=0 表示禁用）
+    max_context_tokens: int = 0
+    max_output_tokens: int = 0
+    budget_soft_limit_ratio: float = 0.75
+    budget_hard_limit_ratio: float = 0.90
+    max_continuations: int = 3
+    max_compactions: int = 3
+
+    def __post_init__(self) -> None:
+        """校验运行时参数约束。
+
+        Raises:
+            ValueError: 当 max_compactions 大于 max_iterations 时抛出。
+        """
+
+        if self.max_compactions > self.max_iterations:
+            raise ValueError(
+                f"max_compactions ({self.max_compactions}) 不能大于 "
+                f"max_iterations ({self.max_iterations})，"
+                "否则 context overflow 重试可能绕过迭代预算限制"
+            )
+
+
+class AsyncAgent:
+    """
+    异步 Agent - 支持 streaming 和工具调用
+    
+    使用示例：
+    
+    ```python
+    # 创建 Agent
+    agent = AsyncAgent(runner=runner, running_config=running_config)
+    
+    # Streaming 模式（默认）
+    async for event in agent.run("分析一下 Tesla 2024 Q3 财报", system_prompt="你是一个助手"):
+        if event.type == EventType.CONTENT_DELTA:
+            print(event.data, end="", flush=True)
+        elif event.type == EventType.TOOL_CALL_START:
+            print(f"\\n[调用工具: {event.data['name']}]")
+    
+    # 非 Streaming 模式
+    result = await agent.run_and_wait("分析一下 Tesla 2024 Q3 财报", system_prompt="你是一个助手")
+    print(result.content)
+    ```
+    """
+    
+    def __init__(
+        self,
+        runner: AsyncRunner,
+        *,
+        tool_executor: Optional[ToolExecutor] = None,
+        tool_trace_recorder_factory: Optional[ToolTraceRecorderFactory] = None,
+        running_config: Optional[AgentRunningConfig] = None,
+        trace_identity: Optional[AgentTraceIdentity] = None,
+        cancellation_token: Optional[CancellationToken] = None,
+    ):
+        """
+        Args:
+            runner: 异步 Runner（AsyncCliRunner 或 AsyncOpenAIRunner）
+            tool_executor: 工具执行器（自动通过 get_schemas() 获取工具定义）
+            tool_trace_recorder_factory: 工具调用追踪 recorder 工厂（可选）。
+            running_config: Agent 运行配置（AgentRunningConfig），包含：
+                - max_iterations: 最大迭代次数（默认 16）
+                - fallback_mode: 超限处理模式（默认 "force_answer"）
+                    * "force_answer": 强制生成答案（生产环境推荐）
+                    * "raise_error": 抛出错误（调试模式）
+                - fallback_prompt: 超限时的自定义提示（仅 force_answer 模式有效）
+                - duplicate_tool_hint_prompt: 检测到重复调用后给模型的软提醒提示
+                - max_consecutive_failed_tool_batches: 连续失败工具批次上限（默认 2）
+                - max_duplicate_tool_calls: 同一工具“无信息增量”的连续重复调用上限（默认 2）
+        """
+        self.runner = runner
+        self.tool_executor = tool_executor
+        self.tool_trace_recorder_factory = tool_trace_recorder_factory
+        self.running_config = running_config or AgentRunningConfig()
+        self.trace_identity = _normalize_trace_identity(trace_identity)
+        Log.verbose(f"Agent 最大迭代次数设置为: {self.running_config.max_iterations}", module=MODULE)
+        self.fallback_mode = self.running_config.fallback_mode
+        self.fallback_prompt = self.running_config.fallback_prompt or DEFAULT_FALLBACK_PROMPT
+        self.duplicate_tool_hint_prompt = (
+            self.running_config.duplicate_tool_hint_prompt or DEFAULT_DUPLICATE_TOOL_HINT_PROMPT
+        )
+        Log.verbose(
+            (
+                "Agent 降级模式设置为: "
+                f"{self.fallback_mode}, "
+                f"fallback_prompt='{self.fallback_prompt}', "
+                f"duplicate_tool_hint_prompt='{self.duplicate_tool_hint_prompt}'"
+            ),
+            module=MODULE,
+        )
+        self.max_consecutive_failed_tool_batches = max(
+            1,
+            self.running_config.max_consecutive_failed_tool_batches,
+        )
+        self.max_duplicate_tool_calls = max(1, self.running_config.max_duplicate_tool_calls)
+        self.cancellation_token = cancellation_token
+        self._active_run_id: Optional[str] = None
+        self._run_guard_lock = Lock()
+
+    def _acquire_run_slot(self, run_id: str) -> None:
+        """申请运行槽位，禁止同一 Agent 实例并发运行。
+
+        Args:
+            run_id: 当前运行 ID。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeError: 当前实例已有进行中的 run/run_and_wait 时抛出。
+        """
+        with self._run_guard_lock:
+            if self._active_run_id is not None:
+                raise RuntimeError(
+                    f"AsyncAgent 不支持并发运行：active_run_id={self._active_run_id}，incoming_run_id={run_id}"
+                )
+            self._active_run_id = run_id
+
+    def _release_run_slot(self, run_id: str) -> None:
+        """释放运行槽位。
+
+        Args:
+            run_id: 当前运行 ID。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+        with self._run_guard_lock:
+            if self._active_run_id == run_id:
+                self._active_run_id = None
+    
+    async def run(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str = "",
+        session_id: str | None = None,
+        stream: bool = True,
+        run_id: str | None = None,
+        **extra_payloads,
+    ) -> AsyncIterator[StreamEvent]:
+        """执行单轮 Agent 调用。
+
+        Args:
+            prompt: 用户输入。
+            system_prompt: 本次调用使用的系统提示词。
+            session_id: 会话标识；为空时默认使用本次运行的 `run_id`。
+            stream: 是否启用 streaming（默认 `True`）。
+            **extra_payloads: 透传给底层 Runner 的额外参数。
+
+        Returns:
+            异步事件流。
+
+        Raises:
+            ValueError: `extra_payloads` 包含内部保留字段时抛出。
+            RuntimeError: 同一 Agent 实例并发运行时抛出。
+        """
+        _validate_extra_payload_keys(extra_payloads)
+        messages = _build_messages_from_prompt(prompt=prompt, system_prompt=system_prompt)
+        async for event in self.run_messages(
+            messages,
+            session_id=session_id,
+            stream=stream,
+            run_id=run_id,
+            **extra_payloads,
+        ):
+            yield event
+
+    async def run_messages(
+        self,
+        messages: List[AgentMessage],
+        *,
+        session_id: str | None = None,
+        stream: bool = True,
+        run_id: str | None = None,
+        **extra_payloads,
+    ) -> AsyncIterator[StreamEvent]:
+        """执行 Agent（调用方直接传入 messages，用于多轮会话）。
+
+        Args:
+            messages: 调用方维护的消息列表。该列表会在运行中被原地追加消息。
+            session_id: 会话标识；为空时默认使用本次运行的 `run_id`。
+            stream: 是否启用 streaming（默认 True）。
+            **extra_payloads: 透传给底层 Runner 的额外参数。
+
+        Yields:
+            StreamEvent: 运行事件流。
+
+        Raises:
+            ValueError: `extra_payloads` 包含内部保留字段时抛出。
+            RuntimeError: 同一 Agent 实例并发运行时抛出。
+        """
+
+        effective_run_id = str(run_id or "").strip() or f"run_{uuid.uuid4().hex[:8]}"
+        _validate_extra_payload_keys(extra_payloads)
+        call_payloads = dict(extra_payloads)
+        effective_session_id = str(session_id or effective_run_id)
+        trace_recorder = (
+            self.tool_trace_recorder_factory.create_recorder(
+                run_id=effective_run_id,
+                session_id=effective_session_id,
+                agent_metadata=self.trace_identity,
+            )
+            if self.tool_trace_recorder_factory is not None
+            else None
+        )
+        self._acquire_run_slot(effective_run_id)
+        if self.tool_executor is not None:
+            self.tool_executor.clear_cursors()
+        Log.verbose(f"[{effective_run_id}] 开始运行 Agent，消息数={len(messages)}", module=MODULE)
+        try:
+            async for event in self._run_loop(
+                messages,
+                stream=stream,
+                run_id=effective_run_id,
+                session_id=effective_session_id,
+                trace_recorder=trace_recorder,
+                **call_payloads,
+            ):
+                yield event
+        finally:
+            await self.runner.close()
+            if trace_recorder is not None:
+                trace_recorder.close()
+            self._release_run_slot(effective_run_id)
+
+    async def _run_loop(
+        self,
+        messages: List[AgentMessage],
+        *,
+        stream: bool,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        trace_recorder: Optional[ToolTraceRecorder] = None,
+        **extra_payloads,
+    ) -> AsyncIterator[StreamEvent]:
+        """
+        统一推理循环（供 streaming / non-streaming 复用）
+        """
+        run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+        session_id = session_id or run_id
+        duplicate_call_guard = DuplicateCallGuard(
+            max_duplicate_tool_calls=self.max_duplicate_tool_calls,
+        )
+
+        # 上下文预算状态（max_context_tokens=0 时不生效）
+        budget_state = ContextBudgetState(
+            max_context_tokens=self.running_config.max_context_tokens,
+            max_output_tokens=self.running_config.max_output_tokens,
+            soft_limit_ratio=self.running_config.budget_soft_limit_ratio,
+            hard_limit_ratio=self.running_config.budget_hard_limit_ratio,
+        )
+
+        # 无状态设计：每次 run 时设置工具
+        if self.tool_executor:
+            self.runner.set_tools(self.tool_executor)
+        
+        iteration = 0
+        consecutive_failed_tool_batches = 0
+        # iteration_counter 单调递增，不受 context_overflow 回退影响，保证 iteration_id 全局唯一。
+        iteration_counter = 0
+        iteration_id = f"{run_id}_iteration_0"
+        # Bug #2 fix: 跨轮次累积内容，确保续写场景下 final_answer_event 包含完整内容
+        accumulated_content_parts: List[str] = []
+        
+        while iteration < self.running_config.max_iterations:
+            # 协作式取消检查：每轮迭代起始时检查取消令牌
+            self._raise_if_cancelled()
+
+            iteration += 1
+            iteration_counter += 1
+            iteration_id = f"{run_id}_iteration_{iteration_counter}"
+            if stream:
+                Log.debug(f"[{iteration_id}] 开始第 {iteration} 次 agent iteration，消息数={len(messages)}", module=MODULE)
+            else:
+                Log.debug(f"[{iteration_id}] 非流式第 {iteration} 次 agent iteration，消息数={len(messages)}", module=MODULE)
+            
+            content_buffer: List[str] = []
+            content_complete_seen = False
+            content_complete_text: Optional[str] = None
+            reasoning_content: Optional[str] = None
+            done_event_seen = False
+            done_event_summary: Dict[str, Any] = {}
+            tool_calls_batch_done_seen = False
+            tool_calls_data: Dict[str, Dict] = {}  # tool_call_id → tool_call data
+            early_exit_reason: Optional[str] = None
+            early_exit_error_type: Optional[str] = None
+            duplicate_hint_tool_name: Optional[str] = None
+            context_overflow_handled = False
+            iteration_tool_schemas: List[Dict[str, Any]] = []
+
+            # 主动预算检查：超过软阈值时在调用前压缩，避免触发 400
+            if (
+                budget_state.is_over_soft_limit
+                and budget_state.compaction_count < self.running_config.max_compactions
+            ):
+                proactive_msg = (
+                    f"⚠️ prompt tokens ({budget_state.current_prompt_tokens}) "
+                    f"超过软阈值 ({budget_state.soft_limit_tokens})，主动压缩消息..."
+                )
+                yield self._annotate_event(
+                    warning_event(proactive_msg),
+                    run_id=run_id, iteration_id=iteration_id,
+                )
+                Log.warn(f"[{iteration_id}] {proactive_msg}", module=MODULE)
+                messages, actually_compacted = _compact_messages(
+                    messages,
+                    summary_header=self.running_config.compaction_summary_header,
+                    summary_instruction=self.running_config.compaction_summary_instruction,
+                )
+                if actually_compacted:
+                    budget_state.compaction_count += 1
+
+            iteration_tool_schemas = self._get_registered_tool_schemas()
+            if trace_recorder is not None:
+                trace_recorder.start_iteration(
+                    iteration_id=iteration_id,
+                    model_input_messages=copy.deepcopy(messages),
+                    tool_schemas=iteration_tool_schemas,
+                )
+            call_payloads = dict(extra_payloads)
+            call_payloads["trace_context"] = {
+                "run_id": run_id,
+                "iteration_id": iteration_id,
+            }
+            async for event in self.runner.call(
+                messages=messages,
+                stream=stream,
+                **call_payloads,
+            ):
+                if event.type == EventType.CONTENT_DELTA:
+                    content_buffer.append(event.data)
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.REASONING_DELTA:
+                    # 推理增量（thinking 模式思维链）—— 透传给调用者供 UI 展示
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.TOOL_CALL_START:
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.TOOL_CALL_DELTA:
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.TOOL_CALL_DISPATCHED:
+                    if trace_recorder is not None:
+                        trace_recorder.on_tool_dispatched(iteration_id=iteration_id, payload=event.data)
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.TOOL_CALL_RESULT:
+                    tool_call_id = event.data["id"]
+                    tool_calls_data.setdefault(tool_call_id, {})["id"] = tool_call_id
+                    tool_calls_data[tool_call_id]["name"] = event.data.get("name", "")
+                    tool_calls_data[tool_call_id]["arguments"] = event.data.get("arguments", {})
+                    tool_calls_data[tool_call_id]["index_in_iteration"] = event.data.get("index_in_iteration", 0)
+                    tool_calls_data[tool_call_id]["result"] = event.data.get("result")
+                    tool_name = tool_calls_data[tool_call_id]["name"]
+                    tool_args = tool_calls_data[tool_call_id]["arguments"]
+                    result = tool_calls_data[tool_call_id].get("result", {})
+                    get_dup_call_spec = getattr(self.tool_executor, "get_dup_call_spec", None)
+                    dup_call_spec = (
+                        cast(Optional[DupCallSpec], get_dup_call_spec(tool_name))
+                        if callable(get_dup_call_spec)
+                        else None
+                    )
+                    duplicate_decision = duplicate_call_guard.evaluate(
+                        tool_name=tool_name,
+                        arguments=tool_args,
+                        result=result,
+                        spec=dup_call_spec,
+                    )
+                    if duplicate_decision.emit_hint and early_exit_reason is None:
+                        duplicate_hint_tool_name = duplicate_decision.hint_tool_name or tool_name
+                    if duplicate_decision.hard_stop and early_exit_reason is None:
+                        early_exit_reason = duplicate_decision.reason
+                        early_exit_error_type = "tool_call_duplicate"
+
+                    if trace_recorder is not None:
+                        trace_recorder.on_tool_result(iteration_id=iteration_id, payload=event.data)
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+
+                elif event.type == EventType.TOOL_CALLS_BATCH_READY:
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+
+                elif event.type == EventType.TOOL_CALLS_BATCH_DONE:
+                    tool_calls_batch_done_seen = True
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.CONTENT_COMPLETE:
+                    content_complete_seen = True
+                    content_complete_text = event.data
+                    # 提取 reasoning_content（thinking 模式下由 Runner 通过 metadata 传递）
+                    rc = event.metadata.get("reasoning_content") if event.metadata else None
+                    if rc:
+                        reasoning_content = rc
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.DONE:
+                    done_event_seen = True
+                    done_event_summary = event.data if isinstance(event.data, dict) else {}
+                    # 更新预算状态
+                    usage = done_event_summary.get("usage")
+                    if usage and isinstance(usage, dict):
+                        budget_state.update_usage(usage)
+                        if trace_recorder is not None:
+                            trace_recorder.record_iteration_usage(
+                                iteration_id=iteration_id,
+                                usage=usage,
+                                budget_snapshot=_build_tool_trace_budget_snapshot(
+                                    budget_state=budget_state,
+                                    iteration=iteration,
+                                    max_iterations=self.running_config.max_iterations,
+                                ),
+                            )
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+
+                elif event.type == EventType.METADATA:
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.WARNING:
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                
+                elif event.type == EventType.ERROR:
+                    error_data = event.data if isinstance(event.data, dict) else {}
+                    error_meta = event.metadata if isinstance(event.metadata, dict) else {}
+                    err_type = error_meta.get("error_type", "")
+                    # context_overflow 特殊处理：压缩后重试
+                    if (
+                        err_type == "context_overflow"
+                        and budget_state.compaction_count < self.running_config.max_compactions
+                    ):
+                        messages, actually_compacted = _compact_messages(
+                            messages,
+                            summary_header=self.running_config.compaction_summary_header,
+                            summary_instruction=self.running_config.compaction_summary_instruction,
+                        )
+                        if actually_compacted:
+                            budget_state.compaction_count += 1
+                            overflow_msg = (
+                                f"⚠️ 上下文超长（prompt_tokens={budget_state.current_prompt_tokens}），"
+                                f"正在执行第 {budget_state.compaction_count} 次消息压缩..."
+                            )
+                            yield self._annotate_event(
+                                warning_event(overflow_msg),
+                                run_id=run_id, iteration_id=iteration_id,
+                            )
+                            Log.warn(f"[{iteration_id}] {overflow_msg}", module=MODULE)
+                            context_overflow_handled = True
+                            break  # 退出 async for，回到 while 循环重试
+                        # 消息已无法进一步压缩，按不可恢复错误处理
+
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                    if not error_data.get("recoverable", False):
+                        if trace_recorder is not None:
+                            trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                        return
+                
+                else:
+                    Log.warn(f"[{iteration_id}] 未知事件类型: {event}", module=MODULE)
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+            
+            # context_overflow 压缩后重试：不计入迭代次数（但 iteration_counter 已递增，保证下一轮 iteration_id 唯一）
+            if context_overflow_handled:
+                if trace_recorder is not None:
+                    trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration_counter)
+                iteration -= 1
+                continue
+
+            final_content = content_complete_text if content_complete_text is not None else "".join(content_buffer)
+
+            if tool_calls_batch_done_seen:
+                assistant_content = final_content or None
+                ordered_tool_calls = sorted(
+                    tool_calls_data.values(),
+                    key=lambda tc: tc.get("index_in_iteration", 0),
+                )
+                if not ordered_tool_calls:
+                    Log.error(f"[{iteration_id}] 收到 TOOL_CALLS_BATCH_DONE 但未收集到任何工具调用", module=MODULE)
+                    error = error_event(
+                        "Tool batch done received without any tool calls",
+                        recoverable=False,
+                        error_type="tool_calls_missing",
+                    )
+                    yield self._annotate_event(error, run_id=run_id, iteration_id=iteration_id)
+                    if trace_recorder is not None:
+                        trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                    return
+
+                if any(is_tool_success(tc.get("result")) for tc in ordered_tool_calls):
+                    consecutive_failed_tool_batches = 0
+                else:
+                    consecutive_failed_tool_batches += 1
+                    if (
+                        consecutive_failed_tool_batches >= self.max_consecutive_failed_tool_batches
+                        and early_exit_reason is None
+                    ):
+                        early_exit_reason = self._build_failed_tool_batches_reason(
+                            consecutive_failed_tool_batches,
+                        )
+                        early_exit_error_type = "consecutive_failed_tool_batches"
+
+                tool_calls_payload: list[ToolCallPayload] = []
+                for tc in ordered_tool_calls:
+                    raw_args = tc.get("arguments", "")
+                    if not isinstance(raw_args, str):
+                        raw_args = json.dumps(raw_args)
+                    tool_calls_payload.append({
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": raw_args,
+                        },
+                    })
+
+                assistant_message = build_assistant_chat_message(
+                    content=assistant_content,
+                    tool_calls=tool_calls_payload,
+                )
+                # 这里保留 reasoning_content 不是随意污染通用 OpenAI messages。
+                # DeepSeek 思考模式的工具调用要求在同一用户问题的后续子请求中回传
+                # reasoning_content，否则会返回 400；MiMo 文档也建议在思考模式下的
+                # 多轮工具调用里保留历史 reasoning_content；Qwen 在开启
+                # preserve_thinking 时也会消费 assistant message 中的 reasoning_content。
+                # 因此这里按 provider 兼容约束保留该字段，但它只应用于当前 tool loop
+                # 的后续请求，不代表新的用户问题也应无条件继续携带历史 thinking。
+                if reasoning_content:
+                    assistant_message = build_assistant_chat_message(
+                        content=assistant_content,
+                        tool_calls=tool_calls_payload,
+                        reasoning_content=reasoning_content,
+                    )
+                messages.append(assistant_message)
+                
+                # Pass 1: 序列化所有工具结果
+                serialized_pairs: List[Tuple[Dict, str]] = []
+                for tc in ordered_tool_calls:
+                    tool_result = tc.get("result")
+                    if tool_result is None:
+                        serialized_pairs.append((tc, ""))
+                        continue
+                    if not isinstance(tool_result, str):
+                        # 投影为 LLM 最优扁平 JSON 并注入剩余轮次信号
+                        budget_remaining = max(0, self.running_config.max_iterations - iteration)
+                        tool_result = json.dumps(
+                            project_for_llm(tool_result, budget=budget_remaining),
+                            ensure_ascii=False,
+                        )
+                    serialized_pairs.append((tc, tool_result))
+
+                # Pass 1.5: 预测性预算检查 —— 估算工具结果注入后是否会超过硬阈值
+                if budget_state.is_budget_enabled:
+                    total_result_chars = sum(len(s) for _, s in serialized_pairs)
+                    estimated_injection_tokens = ToolResultBudgetCapper.estimate_chars_to_tokens(total_result_chars)
+                    projected_tokens = (
+                        budget_state.current_prompt_tokens
+                        + budget_state.latest_completion_tokens
+                        + estimated_injection_tokens
+                        + PREDICTIVE_OVERHEAD_TOKENS
+                    )
+                    if projected_tokens > budget_state.hard_limit_tokens:
+                        serialized_pairs, was_capped = ToolResultBudgetCapper.cap_results_for_budget(
+                            serialized_pairs, budget_state,
+                        )
+                        if was_capped:
+                            cap_msg = (
+                                f"⚠️ 预测性截断：工具结果 {total_result_chars} chars "
+                                f"(≈{estimated_injection_tokens} tokens) 注入后 "
+                                f"预计 {projected_tokens} tokens > "
+                                f"硬阈值 {budget_state.hard_limit_tokens}，"
+                                f"已截断至 soft_limit 预算范围"
+                            )
+                            yield self._annotate_event(
+                                warning_event(cap_msg),
+                                run_id=run_id, iteration_id=iteration_id,
+                            )
+                            Log.warn(f"[{iteration_id}] {cap_msg}", module=MODULE)
+
+                # Pass 2: 注入到 messages
+                for tc, result_str in serialized_pairs:
+                    if not result_str:
+                        continue
+                    messages.append(
+                        build_tool_chat_message(
+                            tool_call_id=tc["id"],
+                            content=result_str,
+                        )
+                    )
+
+                if duplicate_hint_tool_name and not early_exit_reason:
+                    duplicate_warning = warning_event(
+                        f"⚠️ 检测到重复工具调用: {duplicate_hint_tool_name}，已注入防重复提示并继续推理"
+                    )
+                    yield self._annotate_event(duplicate_warning, run_id=run_id, iteration_id=iteration_id)
+                    messages.append(
+                        build_user_chat_message(
+                            self._build_duplicate_tool_hint_prompt(duplicate_hint_tool_name)
+                        )
+                    )
+                    Log.warn(
+                        (
+                            f"[{iteration_id}] ⚠️ 检测到重复工具调用: {duplicate_hint_tool_name}，"
+                            "已注入提示引导模型复用已有结果"
+                        ),
+                        module=MODULE,
+                    )
+
+                if early_exit_reason:
+                    duplicate_log_reason = (
+                        f"⚠️ {early_exit_reason}"
+                        if early_exit_error_type == "tool_call_duplicate"
+                        else early_exit_reason
+                    )
+                    if self.fallback_mode == "raise_error":
+                        Log.error(f"[{iteration_id}] {duplicate_log_reason}", module=MODULE)
+                        error = error_event(
+                            early_exit_reason,
+                            recoverable=False,
+                            error_type=early_exit_error_type or "tool_call_early_exit",
+                        )
+                        yield self._annotate_event(error, run_id=run_id, iteration_id=iteration_id)
+                        if trace_recorder is not None:
+                            trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                        return
+
+                    if self.fallback_mode == "force_answer":
+                        if trace_recorder is not None:
+                            trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                        async for fallback_event in self._run_force_answer(
+                            messages,
+                            stream=stream,
+                            run_id=run_id,
+                            iteration_id=f"{iteration_id}_fallback",
+                            session_id=session_id,
+                            trace_recorder=trace_recorder,
+                            warning_message=f"{duplicate_log_reason}，将基于现有上下文生成最终答案",
+                            log_message=f"[{iteration_id}] {duplicate_log_reason}，进入降级模式生成最终答案。",
+                            **extra_payloads,
+                        ):
+                            yield fallback_event
+                        return
+
+                if trace_recorder is not None:
+                    trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                continue
+
+            if tool_calls_data and not tool_calls_batch_done_seen:
+                Log.error(f"[{iteration_id}] 已派发工具调用但未收到 TOOL_CALLS_BATCH_DONE", module=MODULE)
+                error = error_event(
+                    "Tool calls dispatched but batch done not received",
+                    recoverable=False,
+                    error_type="tool_calls_batch_missing",
+                )
+                yield self._annotate_event(error, run_id=run_id, iteration_id=iteration_id)
+                if trace_recorder is not None:
+                    trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                return
+
+            if (content_complete_seen or done_event_seen) and not tool_calls_data:
+                consecutive_failed_tool_batches = 0
+                # 截断续写：finish_reason=length 时自动续写而非直接终止
+                is_truncated = done_event_summary.get("truncated", False)
+                is_filtered = bool(done_event_summary.get("content_filtered", False))
+                finish_reason = str(done_event_summary.get("finish_reason") or "").strip() or None
+                if (
+                    is_truncated
+                    and budget_state.continuation_count < self.running_config.max_continuations
+                ):
+                    budget_state.continuation_count += 1
+                    continuation_msg = (
+                        f"⚠️ 回答被截断（finish_reason=length），"
+                        f"正在进行第 {budget_state.continuation_count} 次续写..."
+                    )
+                    yield self._annotate_event(
+                        warning_event(continuation_msg),
+                        run_id=run_id, iteration_id=iteration_id,
+                    )
+                    Log.warn(f"[{iteration_id}] {continuation_msg}", module=MODULE)
+                    # Bug #2 fix: 将截断的部分内容累积到跨轮缓冲
+                    if final_content:
+                        accumulated_content_parts.append(final_content)
+                    # 将截断的部分内容作为 assistant message
+                    if final_content:
+                        messages.append(build_assistant_chat_message(content=final_content))
+                    messages.append(
+                        build_user_chat_message(
+                            self.running_config.continuation_prompt or DEFAULT_CONTINUATION_PROMPT
+                        )
+                    )
+                    # 续写前如果超过软阈值则压缩
+                    if (
+                        budget_state.is_over_soft_limit
+                        and budget_state.compaction_count < self.running_config.max_compactions
+                    ):
+                        messages, actually_compacted = _compact_messages(
+                            messages,
+                            summary_header=self.running_config.compaction_summary_header,
+                            summary_instruction=self.running_config.compaction_summary_instruction,
+                        )
+                        if actually_compacted:
+                            budget_state.compaction_count += 1
+                            cont_compact_msg = (
+                                f"⚠️ 续写前 prompt tokens ({budget_state.current_prompt_tokens}) "
+                                f"超过软阈值，执行第 {budget_state.compaction_count} 次消息压缩"
+                            )
+                            yield self._annotate_event(
+                                warning_event(cont_compact_msg),
+                                run_id=run_id, iteration_id=iteration_id,
+                            )
+                            Log.warn(f"[{iteration_id}] {cont_compact_msg}", module=MODULE)
+                    if trace_recorder is not None:
+                        trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                    continue  # 回到 while 循环进行下一轮
+
+                # 拼接所有轮次的内容（续写场景下 accumulated_content_parts 含前序内容）
+                full_content = "".join(accumulated_content_parts) + final_content
+                if is_filtered:
+                    filtered_msg = "⚠️ 回答触发内容过滤，以下结果可能不完整。"
+                    yield self._annotate_event(
+                        warning_event(filtered_msg),
+                        run_id=run_id, iteration_id=iteration_id,
+                    )
+                    Log.warn(f"[{iteration_id}] {filtered_msg}", module=MODULE)
+                self._raise_if_cancelled()
+                final_event = final_answer_event(
+                    full_content,
+                    degraded=is_filtered,
+                    filtered=is_filtered,
+                    finish_reason=finish_reason,
+                )
+                if trace_recorder is not None:
+                    trace_recorder.record_final_response(
+                        iteration_id=iteration_id,
+                        content=full_content,
+                        degraded=is_filtered,
+                    )
+                yield self._annotate_event(final_event, run_id=run_id, iteration_id=iteration_id)
+                if trace_recorder is not None:
+                    trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                return
+            
+        if iteration >= self.running_config.max_iterations:
+            if self.fallback_mode == "raise_error":
+                Log.error(
+                    f"[{iteration_id}] ⚠️ 达到最大迭代次数 {self.running_config.max_iterations}，停止运行",
+                    module=MODULE,
+                )
+                error = error_event(
+                    f"达到最大迭代次数 {self.running_config.max_iterations}",
+                    recoverable=False,
+                    error_type="max_iterations",
+                )
+                yield self._annotate_event(error, run_id=run_id, iteration_id=iteration_id)
+                if trace_recorder is not None:
+                    trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                return
+
+            if self.fallback_mode == "force_answer":
+                if trace_recorder is not None:
+                    trace_recorder.finish_iteration(iteration_id=iteration_id, iteration_index=iteration)
+                async for fallback_event in self._run_force_answer(
+                    messages,
+                    stream=stream,
+                    run_id=run_id,
+                    iteration_id=f"{iteration_id}_fallback",
+                    session_id=session_id,
+                    trace_recorder=trace_recorder,
+                    warning_message=f"⚠️ 已达到最大工具调用次数 {self.running_config.max_iterations}，将基于现有上下文生成最终答案",
+                    log_message=f"[{iteration_id}] ⚠️ 已达到最大工具调用次数 {self.running_config.max_iterations}，进入降级模式生成最终答案。",
+                    **extra_payloads,
+                ):
+                    yield fallback_event
+                return
+
+    def _build_duplicate_tool_hint_prompt(self, tool_name: str) -> str:
+        """构建重复调用软干预提示词。
+
+        Args:
+            tool_name: 触发重复调用的工具名称。
+
+        Returns:
+            供下一轮注入到消息上下文的提示词文本。
+
+        Raises:
+            无。
+        """
+        template = self.duplicate_tool_hint_prompt
+        return template.replace("{{tool_name}}", tool_name or "unknown_tool")
+
+    def _build_failed_tool_batches_reason(self, failure_count: int) -> str:
+        """构建连续失败工具批次的提前退出原因。
+
+        Args:
+            failure_count: 当前连续失败工具批次数。
+
+        Returns:
+            可直接用于日志与错误事件的原因描述。
+
+        Raises:
+            无。
+        """
+
+        return f"连续 {failure_count} 轮工具批次全部失败，停止继续调用工具"
+
+    def _annotate_event(self, event: StreamEvent, *, run_id: str, iteration_id: str) -> StreamEvent:
+        """为事件补充执行级元数据。
+
+        Args:
+            event: 原始事件。
+            run_id: Host 执行 ID。
+            iteration_id: 当前 agent iteration 的标识。
+
+        Returns:
+            补充了元数据的事件。
+
+        Raises:
+            无。
+        """
+
+        metadata = dict(event.metadata) if event.metadata else {}
+        metadata.setdefault("run_id", run_id)
+        metadata.setdefault("iteration_id", iteration_id)
+        if event.type in {
+            EventType.TOOL_CALL_START,
+            EventType.TOOL_CALL_DELTA,
+            EventType.TOOL_CALL_DISPATCHED,
+            EventType.TOOL_CALL_RESULT,
+        }:
+            tool_call_id = event.data.get("id") if isinstance(event.data, dict) else None
+            if tool_call_id:
+                metadata.setdefault("tool_call_id", tool_call_id)
+        event.metadata = metadata
+        return event
+
+    def _raise_if_cancelled(self) -> None:
+        """在提交关键外部事实前执行协作式取消检查。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            CancelledError: 当前 agent run 已被取消时抛出。
+        """
+
+        if self.cancellation_token is not None:
+            self.cancellation_token.raise_if_cancelled()
+
+    async def _run_force_answer(
+        self,
+        messages: List[AgentMessage],
+        *,
+        stream: bool,
+        run_id: str,
+        iteration_id: str,
+        warning_message: str,
+        log_message: str,
+        session_id: str | None = None,
+        trace_recorder: Optional[ToolTraceRecorder] = None,
+        **extra_payloads,
+    ) -> AsyncIterator[StreamEvent]:
+        warning = warning_event(warning_message)
+        yield self._annotate_event(warning, run_id=run_id, iteration_id=iteration_id)
+        Log.warn(log_message, module=MODULE)
+        messages.append(build_user_chat_message(self.fallback_prompt))
+        Log.debug(f"[{iteration_id}] 进入降级模式，追加 fallback prompt 并生成最终答案", module=MODULE)
+
+        if self.tool_executor:
+            self.runner.set_tools(None)
+
+        try:
+            content_buffer = []
+            content_complete_seen = False
+            content_complete_text = None
+            call_payloads = dict(extra_payloads)
+            call_payloads["trace_context"] = {"run_id": run_id, "iteration_id": iteration_id}
+            async for event in self.runner.call(
+                messages=messages,
+                stream=stream,
+                **call_payloads,
+            ):
+                if event.type == EventType.CONTENT_COMPLETE:
+                    content_complete_seen = True
+                    content_complete_text = event.data
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                elif event.type == EventType.CONTENT_DELTA:
+                    content_buffer.append(event.data)
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                elif event.type == EventType.ERROR:
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+                    return
+                else:
+                    yield self._annotate_event(event, run_id=run_id, iteration_id=iteration_id)
+
+            if content_complete_seen or content_buffer:
+                final_content = content_complete_text if content_complete_text is not None else "".join(content_buffer)
+                self._raise_if_cancelled()
+                final_event = final_answer_event(final_content, degraded=True)
+                if trace_recorder is not None:
+                    trace_recorder.record_final_response(
+                        iteration_id=iteration_id,
+                        content=final_content,
+                        degraded=True,
+                    )
+                yield self._annotate_event(final_event, run_id=run_id, iteration_id=iteration_id)
+            else:
+                # 降级调用未产生任何内容，显式 yield ERROR 避免静默空结果
+                yield self._annotate_event(
+                    error_event(
+                        "降级模式未产生任何内容",
+                        recoverable=False,
+                        error_type="force_answer_empty",
+                    ),
+                    run_id=run_id,
+                    iteration_id=iteration_id,
+                )
+        finally:
+            # 恢复工具状态，避免后续（如 run_and_wait 的 warnings 收集等）丢失工具能力
+            if self.tool_executor:
+                self.runner.set_tools(self.tool_executor)
+    
+
+    async def run_and_wait(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str = "",
+        session_id: str | None = None,
+        run_id: str | None = None,
+        **extra_payloads,
+    ) -> "AgentResult":
+        """运行并等待完成，聚合完整结果。
+
+        Args:
+            prompt: 用户输入。
+            system_prompt: 本次调用使用的系统提示词。
+            session_id: 会话标识；为空时默认使用本次运行的 `run_id`。
+            **extra_payloads: 透传给底层 Runner 的额外参数。
+
+        Returns:
+            聚合后的 Agent 结果对象。
+
+        Raises:
+            ValueError: `extra_payloads` 包含内部保留字段时抛出。
+            RuntimeError: 同一 Agent 实例并发运行时抛出。
+        """
+        _validate_extra_payload_keys(extra_payloads)
+        messages = _build_messages_from_prompt(prompt=prompt, system_prompt=system_prompt)
+        tool_calls = []
+        errors = []
+        warnings: List[str] = []
+        final_content = ""
+        degraded = False
+        filtered = False
+
+        async for event in self.run_messages(
+            messages,
+            session_id=session_id,
+            run_id=run_id,
+            # 关键说明：run_and_wait 仅表示“调用方等待完整结果返回”，
+            # 不表示 Runner 必须关闭流式输出。这里保持 stream=True，
+            # 以复用流式事件路径（含工具调用增量事件）并与 run() 语义对齐。
+                stream=True,
+                **extra_payloads,
+        ):
+            if event.type == EventType.FINAL_ANSWER:
+                final_content = event.data.get("content", "")
+                degraded = event.data.get("degraded", False)
+                filtered = bool(event.data.get("filtered", False)) if isinstance(event.data, dict) else False
+            elif event.type == EventType.TOOL_CALL_RESULT:
+                tool_calls.append(event.data)
+            elif event.type == EventType.WARNING:
+                msg = event.data.get("message", "") if isinstance(event.data, dict) else str(event.data)
+                warnings.append(msg)
+            elif event.type == EventType.ERROR:
+                errors.append(event.data)
+
+        return AgentResult(
+            content=final_content,
+            tool_calls=tool_calls,
+            errors=errors,
+            warnings=warnings,
+            messages=messages.copy(),
+            degraded=degraded,
+            filtered=filtered,
+        )
+
+    def _get_registered_tool_schemas(self) -> List[Dict[str, Any]]:
+        """返回当前实际注册给模型的原始工具 schema 列表。
+
+        Args:
+            无。
+
+        Returns:
+            原始工具 schema 列表；不支持工具调用或未注册工具时返回空列表。
+
+        Raises:
+            无。
+        """
+
+        if self.tool_executor is None:
+            return []
+        if not self.runner.is_supports_tool_calling():
+            return []
+        get_schemas = getattr(self.tool_executor, "get_schemas", None)
+        if not callable(get_schemas):
+            return []
+        raw_schemas = get_schemas()
+        if not isinstance(raw_schemas, list):
+            return []
+        return [schema for schema in raw_schemas if isinstance(schema, dict)]
+# ---------- 消息压缩工具函数 ----------
+
+
+def _find_safe_split_point(messages: List[AgentMessage], target_idx: int) -> int:
+    """在 messages 中找到不拆散 tool 消息组的安全切分点。
+
+    assistant(tool_calls=[...]) 和其后续所有 tool 消息构成一个原子组，
+    切分点不能落在组内。如果 target_idx 落在组内，则向前调整到组起始位置。
+
+    Args:
+        messages: 消息列表。
+        target_idx: 期望的切分索引（该位置及之后的消息将被保留）。
+
+    Returns:
+        调整后的安全切分索引（<= target_idx）。
+    """
+    if target_idx <= 0 or target_idx >= len(messages):
+        return target_idx
+    # 如果 target_idx 指向 tool 消息，说明其前面的 assistant(tool_calls) 被切到了压缩侧
+    # 需要向前回溯到该 tool 组的 assistant 消息位置
+    idx = target_idx
+    while idx > 0 and messages[idx].get("role") == "tool":
+        idx -= 1
+    # idx 现在要么指向 assistant(tool_calls) 要么指向非 tool 消息
+    # 如果是 assistant 且含 tool_calls，则从它开始保留
+    if idx < target_idx and messages[idx].get("role") == "assistant" and messages[idx].get("tool_calls"):
+        return idx
+    return target_idx
+
+
+def _compact_messages(
+    messages: List[AgentMessage],
+    recent_keep: int = _COMPACT_RECENT_KEEP,
+    summary_header: str = DEFAULT_COMPACTION_SUMMARY_HEADER,
+    summary_instruction: str = DEFAULT_COMPACTION_SUMMARY_INSTRUCTION,
+) -> Tuple[List[AgentMessage], bool]:
+    """规则化压缩消息列表，降低 token 占用。
+
+    保留策略：
+    1. system message（首条，如果有）
+    2. 首条 user message（任务目标）
+    3. 中间消息压缩为单条结构化摘要
+    4. 最近 recent_keep 条消息原样保留
+
+    切分时保证 assistant(tool_calls) + 对应 tool 消息的原子性，
+    不会将一组工具调用/结果拆散到压缩区和保留区两侧。
+
+    Args:
+        messages: 原始消息列表。
+        recent_keep: 尾部原样保留的条数。
+
+    Returns:
+        (压缩后的新消息列表, 是否实际执行了压缩)。不修改原列表。
+    """
+    if len(messages) <= recent_keep + 2:
+        return list(messages), False
+
+    result: List[AgentMessage] = []
+    start_idx = 0
+
+    # 保留 system message
+    if messages and messages[0].get("role") == "system":
+        result.append(messages[0])
+        start_idx = 1
+
+    # 保留首条 user message
+    first_user_idx = None
+    for i in range(start_idx, len(messages)):
+        if messages[i].get("role") == "user":
+            first_user_idx = i
+            break
+
+    if first_user_idx is not None:
+        result.append(messages[first_user_idx])
+        # 压缩区起始：首条 user 之后，但 system~first_user 之间若有消息也需纳入
+        if first_user_idx > start_idx:
+            compress_start = start_idx
+        else:
+            compress_start = first_user_idx + 1
+    else:
+        compress_start = start_idx
+
+    # 划分需要压缩的中间范围和保留的尾部范围
+    raw_recent_start = max(compress_start, len(messages) - recent_keep)
+    if first_user_idx is not None:
+        # 首条 user 已单独保留；recent tail 不能再从它开始，否则会重复注入任务目标。
+        raw_recent_start = max(raw_recent_start, first_user_idx + 1)
+    # Bug #1 fix: 调整切分点到 tool 消息组边界，防止拆散 assistant(tool_calls)+tool 配对
+    recent_start = _find_safe_split_point(messages, raw_recent_start)
+    middle_messages = messages[compress_start:recent_start]
+    # 从 middle 中移除首条 user（已单独保留）
+    if first_user_idx is not None and compress_start <= first_user_idx < recent_start:
+        middle_messages = [
+            m for i, m in enumerate(messages[compress_start:recent_start], start=compress_start)
+            if i != first_user_idx
+        ]
+
+    if middle_messages:
+        summary = _build_compaction_summary(
+            middle_messages,
+            header=summary_header,
+            instruction=summary_instruction,
+        )
+        result.append(build_user_chat_message(summary))
+
+    # 保留最近 recent_keep 条消息
+    result.extend(messages[recent_start:])
+    return result, True
+
+
+def _build_compaction_summary(
+    messages: List[AgentMessage],
+    header: str = DEFAULT_COMPACTION_SUMMARY_HEADER,
+    instruction: str = DEFAULT_COMPACTION_SUMMARY_INSTRUCTION,
+) -> str:
+    """为被压缩的中间消息构建结构化摘要。
+
+    生成通用摘要（不依赖业务类型），记录消息类型统计和已调用的工具名。
+
+    Args:
+        messages: 被压缩的消息列表。
+        header: 摘要标题行。
+        instruction: 摘要尾部指令。
+
+    Returns:
+        摘要文本。
+    """
+    assistant_count = 0
+    tool_call_count = 0
+    tool_result_count = 0
+    user_count = 0
+    tool_names: set = set()
+
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "assistant":
+            assistant_count += 1
+            tool_calls = msg.get("tool_calls", [])
+            tool_call_count += len(tool_calls)
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                if fn.get("name"):
+                    tool_names.add(fn["name"])
+        elif role == "tool":
+            tool_result_count += 1
+        elif role == "user":
+            user_count += 1
+
+    lines = [
+        header,
+        (
+            f"Compacted {len(messages)} history messages "
+            f"(assistant={assistant_count}, tool_call={tool_call_count}, "
+            f"tool_result={tool_result_count}, user={user_count})."
+        ),
+    ]
+    if tool_names:
+        lines.append(f"Tools called: {', '.join(sorted(tool_names))}.")
+    lines.append(instruction)
+    return "\n".join(lines)
+
+
+class AgentResult:
+    """Agent 执行结果（非 streaming 模式）。
+
+    Attributes:
+        content: 最终回答文本。
+        tool_calls: 工具调用记录列表。
+        errors: 错误记录列表。
+        warnings: 警告消息列表（压缩/续写/截断等治理事件）。
+        messages: 完整消息历史。
+        degraded: 是否为降级回答。
+        filtered: 是否为受过滤完成态。
+    """
+    
+    def __init__(
+        self,
+        content: str,
+        tool_calls: List[Dict],
+        errors: List[Dict],
+        messages: List[AgentMessage],
+        degraded: bool = False,
+        filtered: bool = False,
+        warnings: Optional[List[str]] = None,
+    ):
+        self.content = content
+        self.tool_calls = tool_calls
+        self.errors = errors
+        self.warnings = warnings or []
+        self.messages = messages
+        self.degraded = degraded
+        self.filtered = filtered
+    
+    @property
+    def success(self) -> bool:
+        """是否成功（无错误）"""
+        return len(self.errors) == 0
+    
+    def __repr__(self) -> str:
+        degraded_str = ", degraded=True" if self.degraded else ""
+        filtered_str = ", filtered=True" if self.filtered else ""
+        warnings_str = f", warnings={len(self.warnings)}" if self.warnings else ""
+        return (
+            f"AgentResult(content={self.content[:50]}..., "
+            f"tool_calls={len(self.tool_calls)}, errors={len(self.errors)}"
+            f"{warnings_str}{degraded_str}{filtered_str})"
+        )

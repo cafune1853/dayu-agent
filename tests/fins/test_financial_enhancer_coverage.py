@@ -1,0 +1,932 @@
+"""FinancialEnhancer 覆盖率补充测试（提升到 90%+）。
+
+本测试文件补充财务表格语义增强模块的边界情况、异常处理和特殊场景，
+覆盖所有关键字判定、表格重标注流程和文本规范化。
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, Mock
+from typing import Any, Optional, cast
+
+import pytest
+
+from dayu.fins.processors.financial_enhancer import (
+    FinsProcessorMixin,
+    extra_financial_table_fields,
+    is_financial_table,
+    relabel_single_table,
+    relabel_tables,
+    _normalize_whitespace,
+    _normalize_optional_string,
+    _FINANCIAL_KEYWORDS,
+)
+
+
+@pytest.mark.unit
+class TestNormalizeWhitespace:
+    """_normalize_whitespace 函数单元测试。"""
+
+    def test_normalize_whitespace_multiple_spaces(self) -> None:
+        """验证多个空格被合并为一个。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_whitespace("hello    world")
+        assert result == "hello world"
+
+    def test_normalize_whitespace_tabs_and_newlines(self) -> None:
+        """验证制表符和换行符被转换为空格。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_whitespace("hello\t\tworld\ntest\n")
+        assert result == "hello world test"
+
+    def test_normalize_whitespace_leading_trailing(self) -> None:
+        """验证去除首尾空白。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_whitespace("   hello world   ")
+        assert result == "hello world"
+
+    def test_normalize_whitespace_empty_string(self) -> None:
+        """验证空字符串返回空字符串。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_whitespace("")
+        assert result == ""
+
+    def test_normalize_whitespace_only_spaces(self) -> None:
+        """验证仅空白字符返回空字符串。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_whitespace("    \t\n  ")
+        assert result == ""
+
+    def test_normalize_whitespace_mixed_unicode(self) -> None:
+        """验证处理 Unicode 字符。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_whitespace("资产负债表\n\n利润表")
+        assert result == "资产负债表 利润表"
+
+
+@pytest.mark.unit
+class TestNormalizeOptionalString:
+    """_normalize_optional_string 函数单元测试。"""
+
+    def test_normalize_optional_string_valid(self) -> None:
+        """验证有效字符串正常处理。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_optional_string("  hello  world  ")
+        assert result == "hello world"
+
+    def test_normalize_optional_string_none(self) -> None:
+        """验证 None 返回 None。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_optional_string(None)
+        assert result is None
+
+    def test_normalize_optional_string_empty(self) -> None:
+        """验证空字符串返回 None。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_optional_string("")
+        assert result is None
+
+    def test_normalize_optional_string_whitespace_only(self) -> None:
+        """验证仅空白返回 None。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_optional_string("   \t\n  ")
+        assert result is None
+
+    def test_normalize_optional_string_numeric_input(self) -> None:
+        """验证数字转换为字符串。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = _normalize_optional_string(123)
+        assert result == "123"
+
+    def test_normalize_optional_string_non_string_object(self) -> None:
+        """验证对象转换为字符串。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        obj = Mock()
+        obj.__str__ = Mock(return_value="mock object")
+        result = _normalize_optional_string(obj)
+        assert result == "mock object"
+
+
+@pytest.mark.unit
+class TestIsFinancialTable:
+    """is_financial_table 函数单元测试。"""
+
+    def test_is_financial_table_with_caption_balance_sheet(self) -> None:
+        """验证通过标题识别资产负债表。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption="Balance Sheet December 31, 2023",
+            headers=None,
+            context_before=""
+        )
+        assert result is True
+
+    def test_is_financial_table_with_caption_income_statement(self) -> None:
+        """验证通过标题识别利润表。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption="Statement of Operations",
+            headers=None,
+            context_before=""
+        )
+        assert result is True
+
+    def test_is_financial_table_with_chinese_keywords(self) -> None:
+        """验证中文关键词识别。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption="资产负债表",
+            headers=None,
+            context_before=""
+        )
+        assert result is True
+
+    def test_is_financial_table_with_context_revenue(self) -> None:
+        """验证通过上下文识别收入相关表。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption=None,
+            headers=None,
+            context_before="Following shows the annual revenues"
+        )
+        assert result is True
+
+    def test_is_financial_table_with_headers_net_income(self) -> None:
+        """验证通过表头识别净利润信息。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption=None,
+            headers=["Year", "Net Income", "Total Assets"],
+            context_before=""
+        )
+        assert result is True
+
+    def test_is_financial_table_combined_context(self) -> None:
+        """验证组合多个信息来源的识别。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption="Financial Summary",
+            headers=["Profit", "Assets"],
+            context_before="As shown in the financial reports"
+        )
+        assert result is True
+
+    def test_is_financial_table_no_keywords(self) -> None:
+        """验证不含关键词返回 False。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption="Product Features",
+            headers=["Feature One", "Feature Two"],
+            context_before="This table shows product details"
+        )
+        assert result is False
+
+    def test_is_financial_table_empty_inputs(self) -> None:
+        """验证全为空值返回 False。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption=None,
+            headers=None,
+            context_before=""
+        )
+        assert result is False
+
+    def test_is_financial_table_cash_flow(self) -> None:
+        """验证现金流表识别（英文）。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption="Statement of Cash Flows",
+            headers=None,
+            context_before=""
+        )
+        assert result is True
+
+    def test_is_financial_table_chinese_cash_flow(self) -> None:
+        """验证现金流表识别（中文）。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption="现金流量表",
+            headers=None,
+            context_before=""
+        )
+        assert result is True
+
+    def test_is_financial_table_case_insensitive(self) -> None:
+        """验证大小写不敏感。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption="BALANCE SHEET",
+            headers=None,
+            context_before=""
+        )
+        assert result is True
+
+    def test_is_financial_table_with_empty_headers_list(self) -> None:
+        """验证空头列表处理。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption=None,
+            headers=[],
+            context_before="earnings are crucial"
+        )
+        assert result is True
+
+    def test_is_financial_table_header_with_none_values(self) -> None:
+        """验证包含 None 值的表头处理。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        result = is_financial_table(
+            caption=None,
+            headers=cast(Any, ["Name", None, "Revenue"]),
+            context_before=""
+        )
+        assert result is True
+
+
+@pytest.mark.unit
+class TestRelabelSingleTable:
+    """relabel_single_table 函数单元测试。"""
+
+    def test_relabel_single_table_financial_keyword_match(self) -> None:
+        """验证财务表标注为财务类型。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        table = MagicMock()
+        table.caption = "Balance Sheet"
+        table.headers = None
+        table.context_before = ""
+        
+        relabel_single_table(table)
+        
+        assert table.is_financial is True
+        assert table.table_type == "financial"
+
+    def test_relabel_single_table_non_financial(self) -> None:
+        """验证非财务表标注为数据类型。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        table = MagicMock()
+        table.caption = "Product List"
+        table.headers = ["Name", "Category"]
+        table.context_before = "See our products"
+        
+        relabel_single_table(table)
+        
+        assert table.is_financial is False
+        assert table.table_type == "data"
+
+    def test_relabel_single_table_with_existing_table_type(self) -> None:
+        """验证保留有效的现有表格类型。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        table = MagicMock()
+        table.caption = "Product List"
+        table.headers = None
+        table.context_before = ""
+        table.table_type = "layout"
+        
+        relabel_single_table(table)
+        
+        assert table.is_financial is False
+        assert table.table_type == "layout"
+
+    def test_relabel_single_table_invalid_table_type_normalization(self) -> None:
+        """验证无效表格类型被标准化为 data。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        table = MagicMock()
+        table.caption = "Generic Table"
+        table.headers = None
+        table.context_before = ""
+        table.table_type = "INVALID_TYPE"
+        
+        relabel_single_table(table)
+        
+        assert table.is_financial is False
+        assert table.table_type == "data"
+
+    def test_relabel_single_table_missing_caption(self) -> None:
+        """验证处理缺失标题属性。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        table = MagicMock()
+        del table.caption
+        table.headers = None
+        table.context_before = "revenues increased"
+        
+        relabel_single_table(table)
+        
+        assert table.is_financial is True
+        assert table.table_type == "financial"
+
+    def test_relabel_single_table_missing_headers(self) -> None:
+        """验证处理缺失表头属性。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        table = MagicMock()
+        table.caption = None
+        del table.headers
+        table.context_before = "balance sheet"
+        
+        relabel_single_table(table)
+        
+        assert table.is_financial is True
+
+
+@pytest.mark.unit
+class TestRelabelTables:
+    """relabel_tables 函数单元测试。"""
+
+    def test_relabel_tables_multiple_tables(self) -> None:
+        """验证批量重标注多个表格。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        tables = [
+            MagicMock(caption="Balance Sheet", headers=None, context_before=""),
+            MagicMock(caption="Product List", headers=["Name"], context_before=""),
+            MagicMock(caption="Cash Flow", headers=None, context_before=""),
+        ]
+        
+        relabel_tables(tables)
+        
+        assert tables[0].is_financial is True
+        assert tables[1].is_financial is False
+        assert tables[2].is_financial is True
+
+    def test_relabel_tables_empty_iterable(self) -> None:
+        """验证空迭代器不抛出异常。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        # 应该不拋出异常
+        relabel_tables([])
+
+    def test_relabel_tables_generator(self) -> None:
+        """验证支持生成器迭代。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        def table_generator():
+            yield MagicMock(caption="Balance Sheet", headers=None, context_before="")
+            yield MagicMock(caption="Regular Table", headers=None, context_before="")
+        
+        tables = list(table_generator())
+        relabel_tables(tables)
+        
+        assert tables[0].is_financial is True
+        assert tables[1].is_financial is False
+
+    def test_relabel_tables_all_financial(self) -> None:
+        """验证处理全是财务表的情况。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        tables = [
+            MagicMock(caption="Balance Sheet", headers=None, context_before=""),
+            MagicMock(caption="利润表", headers=None, context_before=""),
+            MagicMock(caption=None, headers=None, context_before="net income"),
+        ]
+        
+        relabel_tables(tables)
+        
+        assert all(t.is_financial for t in tables)
+
+    def test_relabel_tables_with_special_characters_in_caption(self) -> None:
+        """验证处理特殊字符的标题。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        tables = [
+            MagicMock(caption="Balance Sheet (FY 2023)", headers=None, context_before=""),
+            MagicMock(
+                caption="资产负债表（2023年12月31日）",
+                headers=None,
+                context_before=""
+            ),
+        ]
+        
+        relabel_tables(tables)
+        
+        assert tables[0].is_financial is True
+        assert tables[1].is_financial is True
+
+
+@pytest.mark.unit
+class TestFinancialKeywordsCompleteness:
+    """验证金融关键词库的完整性。"""
+
+    def test_financial_keywords_contains_expected_english(self) -> None:
+        """验证包含主要英文关键词。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        expected = [
+            "balance sheet",
+            "income statement",
+            "cash flow",
+            "net income",
+            "revenue",
+            "earnings",
+        ]
+        for keyword in expected:
+            assert keyword in _FINANCIAL_KEYWORDS
+
+    def test_financial_keywords_contains_expected_chinese(self) -> None:
+        """验证包含主要中文关键词。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        expected = [
+            "资产负债表",
+            "利润表",
+            "现金流量表",
+            "营业收入",
+            "净利润",
+        ]
+        for keyword in expected:
+            assert keyword in _FINANCIAL_KEYWORDS
+
+    def test_financial_keywords_is_tuple(self) -> None:
+        """验证关键词库是元组类型。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        assert isinstance(_FINANCIAL_KEYWORDS, tuple)
+
+    def test_financial_keywords_not_empty(self) -> None:
+        """验证关键词库非空。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        assert len(_FINANCIAL_KEYWORDS) > 0
+
+
+@pytest.mark.unit
+class TestFinsProcessorMixin:
+    """FinsProcessorMixin 单元测试。"""
+
+    def test_extra_table_fields_returns_is_financial_false(self) -> None:
+        """验证 is_financial=False 时字段正确返回。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+
+        class FakeTable:
+            is_financial = False
+
+        mixin = FinsProcessorMixin()
+        result = mixin._extra_table_fields(FakeTable())
+        assert result == {"is_financial": False}
+
+    def test_extra_table_fields_returns_is_financial_true(self) -> None:
+        """验证 is_financial=True 时字段正确返回。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+
+        class FakeTable:
+            is_financial = True
+
+        mixin = FinsProcessorMixin()
+        result = mixin._extra_table_fields(FakeTable())
+        assert result == {"is_financial": True}
+
+    def test_extra_table_fields_missing_attribute_defaults_false(self) -> None:
+        """验证表格对象缺少 is_financial 属性时默认返回 False。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+
+        class FakeTable:
+            pass
+
+        mixin = FinsProcessorMixin()
+        result = mixin._extra_table_fields(FakeTable())
+        assert result == {"is_financial": False}
+
+    def test_mixin_delegates_to_extra_financial_table_fields(self) -> None:
+        """验证 Mixin 方法委托 extra_financial_table_fields。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+
+        class FakeTable:
+            is_financial = True
+
+        table = FakeTable()
+        expected = extra_financial_table_fields(table)
+        result = FinsProcessorMixin()._extra_table_fields(table)
+        assert result == expected
+
+    def test_fins_bs_processor_inherits_mixin(self) -> None:
+        """验证 FinsBSProcessor 通过 MRO 继承 FinsProcessorMixin。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        from dayu.fins.processors.fins_bs_processor import FinsBSProcessor
+        assert issubclass(FinsBSProcessor, FinsProcessorMixin)
+        mro_names = [c.__name__ for c in FinsBSProcessor.__mro__]
+        mixin_idx = mro_names.index("FinsProcessorMixin")
+        bs_idx = mro_names.index("BSProcessor")
+        assert mixin_idx < bs_idx, "FinsProcessorMixin 必须在 BSProcessor 之前"
+
+    def test_fins_docling_processor_inherits_mixin(self) -> None:
+        """验证 FinsDoclingProcessor 通过 MRO 继承 FinsProcessorMixin。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        from dayu.fins.processors.fins_docling_processor import FinsDoclingProcessor
+        assert issubclass(FinsDoclingProcessor, FinsProcessorMixin)
+
+    def test_fins_markdown_processor_inherits_mixin(self) -> None:
+        """验证 FinsMarkdownProcessor 通过 MRO 继承 FinsProcessorMixin。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 断言失败时抛出。
+        """
+        from dayu.fins.processors.fins_markdown_processor import FinsMarkdownProcessor
+        assert issubclass(FinsMarkdownProcessor, FinsProcessorMixin)

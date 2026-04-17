@@ -1,0 +1,83 @@
+<style>
+  :root {
+    --page-max-width: 980px;
+    --page-padding-x: 32px;
+    --page-padding-y: 28px;
+  }
+
+  /* 屏幕阅读：做出“页边距 + 页眉/页脚”的观感 */
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: #f6f8fa; /* 类 GitHub 背景 */
+  }
+
+  .page {
+    box-sizing: border-box;
+    max-width: var(--page-max-width);
+    margin: 0 auto;
+    padding: var(--page-padding-y) var(--page-padding-x);
+    background: #fff;
+    min-height: 100%;
+  }
+
+  .print-header,
+  .print-footer {
+    font-size: 10.5pt;
+    color: #666;
+  }
+
+  /* 屏幕：页眉固定在顶端（随滚动保持可见），页脚在文末 */
+  .print-header {
+    position: sticky;
+    top: 0;
+    background: #fff;
+    padding: 10px 0 8px 0;
+    border-bottom: 0.5px solid #e5e7eb;
+    z-index: 10;
+  }
+
+  .print-title {
+    font-weight: 600;
+  }
+
+
+  /* 打印/导出 PDF：页边距 + 页眉页脚（固定定位） */
+  
+</style>
+
+<!-- Word 打开 HTML 时经常不完整支持/不加载外链 CSS：在正文前提供一个“内联表格边框”兜底 -->
+<!-- <style>
+  /* 通用兜底：即便外链 github-markdown.css 不生效，也能看到表格分割线 */
+  .markdown-body table {
+    border-collapse: collapse;
+    border-spacing: 0;
+  }
+  .markdown-body table th,
+  .markdown-body table td {
+    border: 1px solid #d0d7de;
+  }
+</style> -->
+
+<!-- 进一步兜底：仅 Word（mso）条件注释（浏览器会忽略），增强边框落地概率 -->
+<!--[if gte mso 9]>
+<style>
+  .markdown-body table {
+    border-collapse: collapse !important;
+    border-spacing: 0 !important;
+    mso-table-lspace: 0pt;
+    mso-table-rspace: 0pt;
+  }
+  .markdown-body table th,
+  .markdown-body table td {
+    border: 1pt solid #d0d7de !important;
+    mso-border-alt: solid #d0d7de 1.0pt;
+  }
+</style>
+<![endif]-->
+
+<div class="page">
+  <div class="print-header">
+  </div>
+
+  <article class="markdown-body">

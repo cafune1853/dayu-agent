@@ -1,0 +1,16 @@
+{
+  "test_openai": {
+    "runner_type": "openai_compatible",
+    "endpoint_url": "https://example.com/v1/chat/completions",
+    "model": "test-model",
+    "headers": {
+      "Authorization": "Bearer {{TEST_API_KEY}}",
+      "Content-Type": "application/json"
+    },
+    "timeout": 120,
+    "stream_idle_timeout": 45,
+    "stream_idle_heartbeat_sec": 5,
+    "supports_stream": true,
+    "supports_tool_calling": true
+  }
+}

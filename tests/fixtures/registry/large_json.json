@@ -1,0 +1,99 @@
+{
+  "level1": {
+    "level2": {
+      "level3": {
+        "level4": {
+          "level5": {
+            "level6": {
+              "level7": {
+                "level8": {
+                  "level9": {
+                    "level10": {
+                      "data": "deep nested value",
+                      "array": [1, 2, 3, 4, 5],
+                      "metadata": {
+                        "created": "2024-01-01",
+                        "tags": ["test", "deep", "nested"]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "users": [
+    {
+      "id": 1,
+      "name": "Alice",
+      "profile": {
+        "email": "alice@example.com",
+        "preferences": {
+          "theme": "dark",
+          "notifications": {
+            "email": true,
+            "push": false,
+            "settings": {
+              "frequency": "daily",
+              "categories": ["updates", "news"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Bob",
+      "profile": {
+        "email": "bob@example.com",
+        "preferences": {
+          "theme": "light",
+          "notifications": {
+            "email": false,
+            "push": true,
+            "settings": {
+              "frequency": "weekly",
+              "categories": ["updates"]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "config": {
+    "app": {
+      "name": "Test App",
+      "version": "1.0.0",
+      "features": {
+        "auth": {
+          "enabled": true,
+          "providers": ["oauth", "saml"],
+          "settings": {
+            "session_timeout": 3600,
+            "mfa": {
+              "required": false,
+              "methods": ["totp", "sms"]
+            }
+          }
+        },
+        "analytics": {
+          "enabled": true,
+          "endpoints": {
+            "primary": "https://api.example.com/v1",
+            "fallback": "https://backup.example.com/v1"
+          }
+        }
+      }
+    }
+  },
+  "large_array": [
+    {"index": 0, "data": "item_0"},
+    {"index": 1, "data": "item_1"},
+    {"index": 2, "data": "item_2"},
+    {"index": 3, "data": "item_3"},
+    {"index": 4, "data": "item_4"}
+  ]
+}

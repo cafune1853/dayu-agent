@@ -1,0 +1,65 @@
+{
+  "scene": "overview",
+  "model": {
+    "default_name": "mimo-v2-plan",
+    "allowed_names": [
+      "mimo-v2-flash",
+      "mimo-v2-pro",
+      "mimo-v2-plan",
+      "deepseek-chat",
+      "qwen3",
+      "gpt-5.4",
+      "claude-sonnet-4-6",
+      "gemini-2.5-flash"
+    ],
+    "temperature_profile": "overview"
+  },
+  "runtime": {
+    "agent": {
+      "max_iterations": 24
+    }
+  },
+  "version": "v1",
+  "description": "第0章封面页场景",
+  "extends": [],
+  "tool_selection": {
+    "mode": "none"
+  },
+  "defaults": {
+    "missing_fragment_policy": "error"
+  },
+  "fragments": [
+    {
+      "id": "base_agents",
+      "type": "AGENTS",
+      "path": "base/agents.md",
+      "required": true,
+      "order": 100
+    },
+    {
+      "id": "base_soul",
+      "type": "SOUL",
+      "path": "base/soul.md",
+      "required": true,
+      "order": 200
+    },
+    {
+      "id": "base_fact_rules",
+      "type": "SOUL",
+      "path": "base/fact_rules.md",
+      "required": true,
+      "order": 300
+    },
+    {
+      "id": "overview_scene",
+      "type": "SCENE",
+      "path": "scenes/overview.md",
+      "required": true,
+      "order": 400
+    }
+  ],
+  "context_slots": [
+    "fins_default_subject",
+    "base_user"
+  ]
+}

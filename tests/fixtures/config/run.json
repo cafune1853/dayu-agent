@@ -1,0 +1,16 @@
+{
+  "runner_debug_config": {
+    "debug_sse": false,
+    "debug_tool_delta": false
+  },
+  "agent_running_config": {
+    "max_iterations": 2,
+    "fallback_mode": "raise_error"
+  },
+  "doc_tool_limits": {
+    "list_files_max": 10,
+    "get_sections_max": 10,
+    "search_files_max_results": 5,
+    "read_file_max_chars": 1000
+  }
+}

@@ -1,0 +1,25 @@
+flowchart LR
+  C((Customer<br/>客户)) -->|1 购买/刷卡| M((Merchant<br/>商户))
+
+  M -->|2 提交交易| A((Acquirer<br/>收单机构/PSP))
+  A -->|3 授权请求| V((Visa Network<br/>Visa 网络))
+  V -->|4 转发授权| IB((Issuer / Program Bank<br/>发卡行/项目银行))
+
+  %% 4a/4b：发卡侧在后台核验“稳定币资金来源”
+  IB -->|4a 调用| CP["Card Program / Crypto Processor<br/>卡项目方/加密处理商<br/>(例：Bridge 一类)"]
+  CP -->|4b 校验/冻结/预授权| LED["Stablecoin Ledger<br/>稳定币账本（链上或托管）"]
+
+  IB -->|5 授权结果返回| V
+  V -->|5 返回收单侧| A
+  A -->|5 返回商户| M
+
+  %% 6：清算/结算——关键差异在“资金交付侧”
+  CP -. 6a 兑换稳定币 → 法币 .-> FX["Liquidity / Exchange<br/>流动性/交易所/做市"]
+  FX -. 6b 提供法币结算资金 .-> A
+  A -. 6c 结算给商户（法币入账） .-> M
+
+  %% 可选：机构层，发卡/收单与 Visa 之间也可能使用稳定币结算（对用户刷卡体验通常无感）
+  IB -. 可选：与 Visa 的结算义务用稳定币结算 .-> VS["Visa Stablecoin Settlement Rail<br/>Visa 稳定币结算通道"]
+
+  %% 可选：当稳定币需要大额换回法币、或平台补库存时，可能触达发行/赎回主市场（通常由机构完成）
+  FX -. 可选：赎回/补库存（主市场） .-> CM["Circle Mint（机构通道）/Circle（USDC）"]

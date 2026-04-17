@@ -1,0 +1,5 @@
+This file is deeply nested in level2.
+It should only be accessible if level2 is explicitly registered.
+
+Content: Protected level 2 data
+Secret: DO_NOT_ACCESS_WITHOUT_PERMISSION

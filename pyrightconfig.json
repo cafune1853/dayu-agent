@@ -1,0 +1,19 @@
+{
+  "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": [
+    "dayu",
+    "tests",
+    "utils",
+    "render"
+  ],
+  "exclude": [
+    "workspace",
+    "**/.session",
+    "**/__pycache__",
+    "**/node_modules",
+    "**/.*",
+    ".venv"
+  ]
+}

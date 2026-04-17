@@ -1,0 +1,39 @@
+prompt_name: repair_chapter
+version: v1
+inputs:
+  - name: chapter
+    type: scalar
+    required: true
+    description: 当前章节标题
+  - name: company
+    type: scalar
+    required: true
+    description: 公司名称
+  - name: ticker
+    type: scalar
+    required: true
+    description: 股票代码
+  - name: allow_new_facts
+    type: scalar
+    required: true
+    description: 是否允许为最低必需项补入新事实
+  - name: retry_scope
+    type: scalar
+    required: true
+    description: 本轮修复范围
+  - name: chapter_contract
+    type: json_block
+    required: true
+    description: 本章合同 JSON 对象
+  - name: last_repair_contract
+    type: json_block
+    required: true
+    description: 结构化修复合同
+  - name: last_wrote_content
+    type: markdown_block
+    required: true
+    description: 当前章节正文
+  - name: current_visible_headings
+    type: markdown_block
+    required: true
+    description: 当前正文中真实存在的可见标题列表

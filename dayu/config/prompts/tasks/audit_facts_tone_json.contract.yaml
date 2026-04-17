@@ -1,0 +1,39 @@
+prompt_name: audit_facts_tone_json
+version: v1
+inputs:
+  - name: company
+    type: scalar
+    required: true
+    description: 公司名称
+  - name: ticker
+    type: scalar
+    required: true
+    description: 股票代码
+  - name: audit_mode
+    type: scalar
+    required: true
+    description: 当前审计模式（初始整章审计 / 修复后局部复审）
+  - name: chapter_markdown
+    type: markdown_block
+    required: true
+    description: 待审计章节正文
+  - name: skeleton
+    type: markdown_block
+    required: true
+    description: 去除 HTML 注释后的章节骨架
+  - name: chapter_contract
+    type: json_block
+    required: true
+    description: 章节级写作边界，用于识别 must_not_cover 等越界约束
+  - name: item_rules
+    type: json_block
+    required: true
+    description: 当前章节允许的条件型可见小节/条目规则
+  - name: audit_scope_rules
+    type: json_block
+    required: true
+    description: 本轮审计规则范围
+  - name: repair_contract
+    type: json_block
+    required: false
+    description: 修复后局部复审时使用的修复合同

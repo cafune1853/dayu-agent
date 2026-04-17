@@ -1,0 +1,45 @@
+{
+  "schema_version": "search_c_thresholds_v1",
+  "profiles": [
+    {
+      "profile_id": "annual_quarter_core40_profile",
+      "pack_name": "annual_quarter_core40",
+      "form_types": ["10-K", "10-Q", "20-F", "FY", "H1"],
+      "thresholds": {
+        "t5": 0.55,
+        "t7": 0.7,
+        "t9": 0.85
+      }
+    },
+    {
+      "profile_id": "event_pack_profile",
+      "pack_name": "event_pack",
+      "form_types": ["8-K", "6-K"],
+      "thresholds": {
+        "t5": 0.25,
+        "t7": 0.4,
+        "t9": 0.55
+      }
+    },
+    {
+      "profile_id": "governance_pack_profile",
+      "pack_name": "governance_pack",
+      "form_types": ["DEF 14A"],
+      "thresholds": {
+        "t5": 0.5,
+        "t7": 0.65,
+        "t9": 0.8
+      }
+    },
+    {
+      "profile_id": "ownership_pack_profile",
+      "pack_name": "ownership_pack",
+      "form_types": ["SC 13G", "SC 13D"],
+      "thresholds": {
+        "t5": 0.65,
+        "t7": 0.8,
+        "t9": 0.9
+      }
+    }
+  ]
+}
